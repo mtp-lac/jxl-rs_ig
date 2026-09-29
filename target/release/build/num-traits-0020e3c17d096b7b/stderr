@@ -1,0 +1,8 @@
+warning: failed to connect to jobserver from environment variable `CARGO_MAKEFLAGS="-j --jobserver-fds=__rust_jobserver_semaphore_4104177457 --jobserver-auth=__rust_jobserver_semaphore_4104177457"`: cannot open path or name __rust_jobserver_semaphore_4104177457 from the jobserver environment variable value: Access is denied. (os error 5)
+  |
+  = note: the build environment is likely misconfigured
+
+warning: failed to connect to jobserver from environment variable `CARGO_MAKEFLAGS="-j --jobserver-fds=__rust_jobserver_semaphore_4104177457 --jobserver-auth=__rust_jobserver_semaphore_4104177457"`: cannot open path or name __rust_jobserver_semaphore_4104177457 from the jobserver environment variable value: Access is denied. (os error 5)
+  |
+  = note: the build environment is likely misconfigured
+
