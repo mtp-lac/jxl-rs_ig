@@ -23,7 +23,7 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: JxlCodec.dll
-            artifact_path: target/release/jxl_codec.dll
+            artifact_path: target/release/JxlCodec.dll
           - os: ubuntu-latest
             artifact_name: libjxl_codec.so
             artifact_path: target/release/libjxl_codec.so
@@ -48,6 +48,11 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release --locked
+
+      - name: Rename Windows library for ImageGlass
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item target/release/jxl_codec.dll target/release/JxlCodec.dll
 
       - name: Plugin smoke test (Windows)
         if: runner.os == 'Windows'
@@ -81,8 +86,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/JxlCodec.dll
-            artifacts/libjxl_codec.so
-            artifacts/libjxl_codec.dylib
+            artifacts/*
             igplugin.json
           generate_release_notes: true
