@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target/
+/tests/target/
+
+# Local scratch / dev tooling
+/probe/
+
+# IDE
+.idea/
+.vscode/
+*.swp

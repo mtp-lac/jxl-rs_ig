@@ -1,6 +1,6 @@
 [package]
 name = "jxl_codec"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["JXL Codec Developer"]
 description = "JPEG XL codec plugin for ImageGlass using jxl-rs"
@@ -11,7 +11,7 @@ name = "jxl_codec"
 crate-type = ["cdylib"]
 
 [dependencies]
-jxl = "=0.7.4"
+jxl = "=0.8.0"
 
 [profile.release]
 opt-level = 3

@@ -106,7 +106,10 @@ fn main() {
     if status != 0 { panic!("get_capability failed: {}", status); }
     let cap = unsafe { &*cap_ptr };
     println!("Codec: {} ({})", String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(cap.codec_name.data, cap.codec_name.length as usize) }), String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(cap.codec_id.data, cap.codec_id.length as usize) }));
-    println!("Extensions: {:?}", (0..cap.decode_extension_count).map(|i| unsafe { std::slice::from_raw_parts((*cap.decode_extensions.add(i)).data, (*cap.decode_extensions.add(i)).length as usize) }.iter().map(|s| String::from_utf16_lossy(s)).collect::<Vec<_>>());
+    println!("Extensions: {:?}", (0..cap.decode_extension_count).map(|i| {
+        let ext = unsafe { std::slice::from_raw_parts((*cap.decode_extensions.add(i as usize)).data, (*cap.decode_extensions.add(i as usize)).length as usize) };
+        String::from_utf16_lossy(ext)
+    }).collect::<Vec<_>>());
 
     // Test extension matching
     let ext = ".jxl";

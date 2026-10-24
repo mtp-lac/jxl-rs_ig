@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use jxl::api::{JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, check_signature};
+use jxl::api::{ExtraChannel, Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, JxlSignature, check_signature};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
@@ -33,6 +33,27 @@ const DECODE_FAILED: IGStatus = 4;
 const OUT_OF_MEMORY: IGStatus = 5;
 const INTERNAL: IGStatus = 6;
 const IO_ERROR: IGStatus = 8;
+
+/// Available physical memory, in bytes; `usize::MAX` if the query fails, which
+/// keeps decoding rather than blocking on a platform we cannot measure.
+fn available_physical_bytes() -> usize {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64, avail_phys: u64,
+        total_page_file: u64, avail_page_file: u64,
+        total_virtual: u64, avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    extern "system" { fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32; }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0, total_phys: 0, avail_phys: 0, total_page_file: 0,
+        avail_page_file: 0, total_virtual: 0, avail_virtual: 0, avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(std::ptr::addr_of_mut!(status)) } != 0 { status.avail_phys as usize } else { usize::MAX }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -100,7 +121,7 @@ fn canceled(token: *mut c_void) -> bool {
 
 impl PluginState {
     fn new() -> Self {
-        let mut strings: Vec<Vec<u16>> = ["Plugin_JxlCodec", "JPEG XL", "1.0.0", "codec_jxl", ".jxl"].iter().map(|s| s.encode_utf16().collect()).collect();
+        let mut strings: Vec<Vec<u16>> = ["Plugin_JxlCodec", "JPEG XL", "1.1.0", "codec_jxl", ".jxl"].iter().map(|s| s.encode_utf16().collect()).collect();
         let refs: Vec<_> = strings.iter().map(|s| IGStringRef { data: s.as_ptr(), length: s.len() as i32 }).collect();
         let extensions = vec![refs[4]].into_boxed_slice();
         let capability = Box::new(IGCodecCapability {
@@ -151,19 +172,19 @@ unsafe extern "C" fn get_codec(index: i32, out: *mut *mut IGCodecApi) -> i32 {
 unsafe extern "C" fn get_capability(out: *mut *mut IGCodecCapability) -> i32 {
     boundary(|| { if out.is_null() { return INVALID_ARG; } unsafe { *out = std::ptr::addr_of!(*STATE.get().expect("plugin not initialized").capability) as *mut IGCodecCapability; } OK }) as i32
 }
+/// ABI contract: plain boolean int — 1 = handled, 0 = not. NOT an IGStatus.
 unsafe extern "C" fn can_handle_extension(ext: IGStringRef) -> i32 {
-    boundary(|| {
-        if ext.data.is_null() || ext.length <= 0 { return UNSUPPORTED; }
+    boundary_bool(|| {
+        if ext.data.is_null() || ext.length <= 0 { return false; }
         let s = unsafe { std::slice::from_raw_parts(ext.data, ext.length as usize) };
-        match String::from_utf16(s) { Ok(v) if v.eq_ignore_ascii_case(".jxl") => OK, _ => UNSUPPORTED }
-    }) as i32
+        matches!(String::from_utf16(s), Ok(v) if v.eq_ignore_ascii_case(".jxl"))
+    })
 }
 unsafe extern "C" fn can_handle_signature(data: *const u8, len: i32) -> i32 {
     if data.is_null() || len <= 0 { return 0; }
     match check_signature(unsafe { std::slice::from_raw_parts(data, len as usize) }) {
-        ProcessingResult::Complete { result: Some(_) } => 1,
-        ProcessingResult::Complete { result: None } => 0,
-        ProcessingResult::NeedsMoreInput { .. } => 0,
+        JxlSignature::Codestream | JxlSignature::Container => 1,
+        JxlSignature::None | JxlSignature::NeedMoreInput { .. } => 0,
     }
 }
 unsafe extern "C" fn load_metadata(path: IGStringRef, out: *mut IGImageInfo, cancel: *mut c_void) -> i32 {
@@ -195,6 +216,10 @@ unsafe extern "C" fn decode_static_raster(path: IGStringRef, frame: i32, out: *m
         let (width, height, _, _, animated, _) = match decode_info(&data) { Ok(v) => v, Err(s) => return s };
         if animated { return UNSUPPORTED; }
         let bytes = match width.checked_mul(height).and_then(|n| n.checked_mul(4)) { Some(n) if n <= MAX_OUTPUT_BYTES => n, _ => return DECODE_FAILED };
+        // A 32000x32000 frame alone is ~4 GB, and jxl-rs plus the host's own copy
+        // need more on top. Refuse into OutOfMemory rather than paging the host.
+        let required = bytes.saturating_add(bytes / 2).saturating_add(64 * 1024 * 1024);
+        if required > available_physical_bytes() { return OUT_OF_MEMORY; }
         let mut pixels = Vec::new();
         if pixels.try_reserve_exact(bytes).is_err() { return OUT_OF_MEMORY; }
         pixels.resize(bytes, 0);
@@ -225,42 +250,57 @@ fn string_path(s: IGStringRef) -> Result<std::path::PathBuf, IGStatus> {
 fn decode_info(data: &[u8]) -> Result<(usize, usize, bool, Option<Vec<u8>>, bool, i32), IGStatus> {
     let mut options = JxlDecoderOptions::default();
     options.sample_limit = Some(JXL_SAMPLE_LIMIT);
-    let decoder = JxlDecoder::new(options);
-    let mut input = data;
-    let decoder = match decoder.process(&mut input, None).map_err(|_| DECODE_FAILED)? {
-        ProcessingResult::Complete { result } => result,
-        ProcessingResult::NeedsMoreInput { .. } => return Err(DECODE_FAILED),
-    };
-    let basic = decoder.basic_info();
+    let mut decoder = JxlDecoder::new(options);
+    let mut input: &[u8] = data;
+    loop {
+        match decoder.process(&mut input, None, None).map_err(|_| DECODE_FAILED)? {
+            Event::BasicInfo => break,
+            Event::NeedMoreInput { .. } | Event::Complete => return Err(DECODE_FAILED),
+            Event::FrameHeader | Event::FrameComplete { .. } => {}
+        }
+    }
+    let basic = decoder.basic_info().ok_or(DECODE_FAILED)?;
     let (w, h) = basic.size;
-    let has_alpha = basic.extra_channels.iter().any(|c| matches!(c.ec_type, jxl::headers::extra_channels::ExtraChannel::Alpha));
+    let has_alpha = basic.extra_channels.iter().any(|c| matches!(c.ec_type, ExtraChannel::Alpha));
     let animated = basic.animation.is_some();
-    let orientation = basic.orientation as i32;
-    let icc = decoder.output_color_profile().try_as_icc().map(|p| p.to_vec());
+    // jxl-rs 0.8.0 always renders upright: `JxlDecoderOptions::adjust_orientation`
+    // defaults to true, so `basic.size` is the oriented size and the render pipeline
+    // rotates pixels (display_pixel). The pixels we hand back need no further
+    // transform — report Identity, or the host would rotate a second time.
+    let orientation = 1;
+    let icc = decoder.output_color_profile().and_then(|p| p.try_as_icc()).map(|p| p.to_vec());
     if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|n| n > MAX_IMAGE_PIXELS) || w > i32::MAX as usize || h > i32::MAX as usize { return Err(DECODE_FAILED); }
     Ok((w, h, has_alpha, icc, animated, orientation))
 }
 fn decode_pixels(data: &[u8], width: usize, height: usize, pixels: &mut [u8]) -> Result<(), ()> {
     let mut options = JxlDecoderOptions::default();
     options.sample_limit = Some(JXL_SAMPLE_LIMIT);
-    let decoder = JxlDecoder::new(options);
-    let mut input = data;
-    let mut decoder = match decoder.process(&mut input, None).map_err(|_| ())? {
-        ProcessingResult::Complete { result } => result,
-        ProcessingResult::NeedsMoreInput { .. } => return Err(()),
-    };
-    let channels = decoder.basic_info().extra_channels.len();
-    decoder.set_pixel_format(JxlPixelFormat::rgba8(channels)).map_err(|_| ())?;
-    let frame_decoder = match decoder.process(&mut input, None).map_err(|_| ())? {
-        ProcessingResult::Complete { result } => result,
-        ProcessingResult::NeedsMoreInput { .. } => return Err(()),
-    };
-    let mut buffers = [JxlOutputBuffer::new(pixels, height, width * 4)];
-    match frame_decoder.process(&mut input, &mut buffers, None).map_err(|_| ())? {
-        ProcessingResult::Complete { .. } => Ok(()),
-        ProcessingResult::NeedsMoreInput { .. } => Err(()),
+    let mut decoder = JxlDecoder::new(options);
+    let mut input: &[u8] = data;
+    let mut buffers: Option<[JxlOutputBuffer; 1]> = None;
+    let mut frame_complete = false;
+    loop {
+        match decoder.process(&mut input, buffers.as_mut().map(|b| &mut b[..]), None).map_err(|_| ())? {
+            Event::BasicInfo => {
+                let channels = decoder.basic_info().map_or(0, |b| b.extra_channels.len());
+                decoder.set_pixel_format(JxlPixelFormat::rgba8(channels)).map_err(|_| ())?;
+                buffers = Some([JxlOutputBuffer::new(pixels, height, width * 4)]);
+            }
+            Event::FrameComplete { .. } => frame_complete = true,
+            Event::Complete => break,
+            Event::NeedMoreInput { .. } => {
+                if input.is_empty() { return Err(()); }
+            }
+            Event::FrameHeader => {}
+        }
     }
+    if frame_complete { Ok(()) } else { Err(()) }
 }
 fn boundary(f: impl FnOnce() -> IGStatus) -> IGStatus {
     match catch_unwind(AssertUnwindSafe(f)) { Ok(status) => status, Err(_) => INTERNAL }
+}
+/// Panic boundary for the two boolean probes (CanHandleExtension/Signature),
+/// which return 1/0 rather than an IGStatus.
+fn boundary_bool(f: impl FnOnce() -> bool) -> i32 {
+    match catch_unwind(AssertUnwindSafe(f)) { Ok(true) => 1, Ok(false) | Err(_) => 0 }
 }
