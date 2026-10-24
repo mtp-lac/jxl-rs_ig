@@ -22,8 +22,8 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: JxlCodec.dll
-            artifact_path: target/release/JxlCodec.dll
+            artifact_name: jxl_codec.dll
+            artifact_path: target/release/jxl_codec.dll
           - os: ubuntu-latest
             artifact_name: libjxl_codec.so
             artifact_path: target/release/libjxl_codec.so
@@ -48,11 +48,6 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release --locked
-
-      - name: Rename Windows library for ImageGlass
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Copy-Item target/release/jxl_codec.dll target/release/JxlCodec.dll
 
       - name: Plugin smoke test (Windows)
         if: runner.os == 'Windows'
