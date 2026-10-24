@@ -1,0 +1,94 @@
+name: Nightly
+
+on:
+  schedule:
+    # Daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build nightly (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_path: target/release/jxl_codec.dll
+          - os: ubuntu-latest
+            artifact_path: target/release/libjxl_codec.so
+          - os: macos-latest
+            artifact_path: target/release/libjxl_codec.dylib
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve latest upstream jxl-rs revision
+        id: upstream
+        shell: bash
+        run: |
+          SHA=$(git ls-remote https://github.com/libjxl/jxl-rs.git refs/heads/main | awk '{print $1}')
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Point jxl dependency at latest upstream
+        shell: bash
+        run: |
+          sed -i "s|^jxl = .*|jxl = { git = \"https://github.com/libjxl/jxl-rs\", rev = \"${{ steps.upstream.outputs.sha }}\" }|" Cargo.toml
+          grep '^jxl' Cargo.toml
+          cargo update -p jxl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build nightly (release)
+        run: cargo build --release
+
+      - name: Plugin smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: cargo run --release --manifest-path tests/Cargo.toml
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-jxl-codec-${{ runner.os }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish nightly pre-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Move nightly tag to this commit
+        run: |
+          git tag -f nightly
+          git push -f origin nightly
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update nightly pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          body: |
+            Nightly build from the latest upstream `libjxl/jxl-rs` (`main`).
+            Pre-release — not intended for production use.
+          prerelease: true
+          files: |
+            artifacts/*
+            igplugin.json
