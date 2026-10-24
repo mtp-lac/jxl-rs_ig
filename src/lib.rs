@@ -36,6 +36,7 @@ const IO_ERROR: IGStatus = 8;
 
 /// Available physical memory, in bytes; `usize::MAX` if the query fails, which
 /// keeps decoding rather than blocking on a platform we cannot measure.
+#[cfg(target_os = "windows")]
 fn available_physical_bytes() -> usize {
     #[repr(C)]
     struct MemoryStatusEx {
@@ -53,6 +54,53 @@ fn available_physical_bytes() -> usize {
         avail_page_file: 0, total_virtual: 0, avail_virtual: 0, avail_extended_virtual: 0,
     };
     if unsafe { GlobalMemoryStatusEx(std::ptr::addr_of_mut!(status)) } != 0 { status.avail_phys as usize } else { usize::MAX }
+}
+
+/// Linux: parse `MemAvailable` from `/proc/meminfo` (reported in kB).
+#[cfg(target_os = "linux")]
+fn available_physical_bytes() -> usize {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else { return usize::MAX };
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            return kb.saturating_mul(1024) as usize;
+        }
+    }
+    usize::MAX
+}
+
+/// macOS: total physical memory via `sysctlbyname("hw.memsize")`.
+#[cfg(target_os = "macos")]
+fn available_physical_bytes() -> usize {
+    use std::ffi::{c_char, c_int, c_void};
+    extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *const c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    let mut memsize: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let ok = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut memsize as *mut u64).cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ok == 0 && len == std::mem::size_of::<u64>() { memsize as usize } else { usize::MAX }
+}
+
+/// Other platforms: no reliable query; rely on allocation failure instead of
+/// refusing up front.
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn available_physical_bytes() -> usize {
+    usize::MAX
 }
 
 #[repr(C)]
