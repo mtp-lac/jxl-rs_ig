@@ -40,7 +40,8 @@ jobs:
       - name: Point jxl dependency at latest upstream
         shell: bash
         run: |
-          sed -i "s|^jxl = .*|jxl = { git = \"https://github.com/libjxl/jxl-rs\", rev = \"${{ steps.upstream.outputs.sha }}\" }|" Cargo.toml
+          sed "s|^jxl = .*|jxl = { git = \"https://github.com/libjxl/jxl-rs\", rev = \"${{ steps.upstream.outputs.sha }}\" }|" Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
           grep '^jxl' Cargo.toml
           cargo update -p jxl
 
