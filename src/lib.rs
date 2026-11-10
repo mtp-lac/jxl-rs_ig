@@ -316,7 +316,13 @@ fn decode_info(data: &[u8]) -> Result<(usize, usize, bool, Option<Vec<u8>>, bool
     // rotates pixels (display_pixel). The pixels we hand back need no further
     // transform — report Identity, or the host would rotate a second time.
     let orientation = 1;
-    let icc = decoder.output_color_profile().and_then(|p| p.try_as_icc()).map(|p| p.to_vec());
+    // Upstream jxl-rs (a4334410, "ICC tone mapping: tone-map PQ from intensity_target")
+    // made `try_as_icc` take the image's intensity target so HDR (PQ/HLG) profiles are
+    // tone-mapped correctly instead of assuming 10000 nits.
+    let icc = decoder
+        .output_color_profile()
+        .and_then(|p| p.try_as_icc(basic.tone_mapping.intensity_target))
+        .map(|p| p.to_vec());
     if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|n| n > MAX_IMAGE_PIXELS) || w > i32::MAX as usize || h > i32::MAX as usize { return Err(DECODE_FAILED); }
     Ok((w, h, has_alpha, icc, animated, orientation))
 }
