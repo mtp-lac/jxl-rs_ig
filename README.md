@@ -7,7 +7,15 @@ This plugin implements a native codec for ImageGlass 10 that adds support for JP
 - Decodes static JPEG XL images (.jxl extension)
 - Extracts image metadata (dimensions, color space, alpha channel)
 - Reports frame count for static images
-- Supports cancellation during decode operations
+- Supports cancellation during metadata and decode operations (polled at every
+  input chunk, so long decodes can be aborted)
+- Streaming input: metadata loads only read the file header; decodes read the
+  file incrementally, keeping peak memory close to the pixel buffer
+- Bounded, de-duplicated ICC profile cache — browsing thousands of files does
+  not accumulate memory
+- Size guards: frames above 32000×32000 are refused, and huge allocations are
+  backed by an available-physical-memory check before `try_reserve` (OOM is
+  reported, never a crash)
 
 ## Prerequisites
 
@@ -54,7 +62,7 @@ The build produces a shared library:
   "id": "Plugin_JxlCodec",
   "name": "JPEG XL Codec",
   "description": "Native codec plugin for JPEG XL (JXL) image format support using jxl-rs decoder",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "JXL Codec Developer",
   "website": "https://github.com/libjxl/jxl-rs",
   "kind": "Codec",
@@ -72,6 +80,16 @@ The plugin implements the ImageGlass native codec ABI:
 4. **`load_metadata`** - Extracts image info using jxl-rs decoder
 5. **`decode_static_raster`** - Decodes image to BGRA8 pixel format
 6. **`free_pixel_buffer`** - Releases allocated pixel memory
+
+Both `load_metadata` and `decode_static_raster` feed the `jxl-rs` decoder from
+an incremental file reader: a metadata call stops as soon as the image headers
+are parsed (it never reads the pixel payload), and a decode reads one chunk at a
+time. Each chunk boundary is also a cancellation poll, so the host's
+`IsCancellationRequested` is honored during long work. ICC profiles returned
+through `IGImageInfo.IccProfileData` are kept in a de-duplicated, bounded store
+(identical profiles share one allocation; the store caps out at 64 profiles /
+4 MiB with FIFO eviction) — the ABI only requires the host to read the profile
+synchronously inside `LoadMetadata`.
 
 ## Color Space Handling
 

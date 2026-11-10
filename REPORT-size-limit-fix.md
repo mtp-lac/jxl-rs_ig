@@ -120,3 +120,30 @@ round 2: decode OK 45.4s                                                        
 - No changes to `jxl-rs`; all decoding stays in the library.
 
 Rebuild: `cargo build --release --offline` → `target/release/jxl_codec.dll` (2,921,472 B). Install per README.
+
+## 8. v1.2.0 — follow-ups addressed (2026-10-25)
+
+- **§6.1 unbounded ICC growth — fixed.** `IccProfileData` is now served from a
+  de-duplicated, bounded store (`IccStore`): identical profiles share one
+  allocation (keyed by content hash), and the store caps at 64 profiles / 4 MiB
+  with FIFO eviction. The ABI only requires the host to read the profile
+  synchronously inside `LoadMetadata`, so eviction cannot dangle an in-flight
+  pointer.
+- **Metadata loads no longer read the whole file.** `load_metadata` streams the
+  file (256 KiB chunks) and stops at the first frame header — dimensions, extra
+  channels and the colour profile are all known by then (plus up to 4 extra
+  chunks if the profile has not appeared yet). `FileSizeBytes` now comes from
+  `metadata()`, not from reading the file.
+- **Decodes are streaming and cancellable.** `decode_static_raster` feeds the
+  decoder 1 MiB chunks and polls `IsCancellationRequested` at every chunk/event
+  boundary, so a 30–50 s decode responds to cancellation instead of only
+  checking before the call. Peak memory is the pixel buffer plus one chunk.
+- **Release build** now sets `strip = "symbols"`; the DLL is
+  `target/release/jxl_codec.dll` (3,005,952 B, `ig_plugin_get_api` export
+  verified via `GetProcAddress`).
+- Verification (rebuilt against this code): ABI probe passes on `test.jxl`
+  (LoadMetadata → DecodeStaticRaster → FreePixelBuffer, BGRA8, orientation 1),
+  `IG_CANCEL=1` probe returns `IGStatus_Canceled (2)` as expected, and the
+  `tests/` smoke harness passes. No 16k/32k fixtures were available in this
+  environment, so the big-image paths are validated by code review plus the
+  unchanged dimension/RAM guards from §4.

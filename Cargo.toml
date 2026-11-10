@@ -1,6 +1,6 @@
 [package]
 name = "jxl_codec"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["JXL Codec Developer"]
 description = "JPEG XL codec plugin for ImageGlass using jxl-rs"
@@ -17,4 +17,7 @@ jxl = "=0.8.0"
 opt-level = 3
 lto = true
 codegen-units = 1
+# Smaller DLL; cdylib exports are preserved, panic frames are not needed across
+# the FFI boundary (all entry points wrap bodies in catch_unwind).
+strip = "symbols"
 
