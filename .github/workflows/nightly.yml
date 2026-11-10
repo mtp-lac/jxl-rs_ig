@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Branch the nightly is built from. Scheduled runs always use the default
+  # branch's workflow file, so this must be selected explicitly below.
+  NIGHTLY_BRANCH: nightly
 
 permissions:
   contents: write
@@ -29,6 +32,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_BRANCH }}
+
+      # A `schedule` event always runs the default branch's copy of this file
+      # with GITHUB_REF=refs/heads/<default>. If that happens, the explicit
+      # `ref:` above still lands us on NIGHTLY_BRANCH, but a manual dispatch
+      # could also be pointed at the wrong branch. Fail loudly either way
+      # instead of silently publishing a main build as "nightly".
+      - name: Verify we are building the nightly branch
+        shell: bash
+        run: |
+          # Compare full refs: the abbreviated forms are ambiguous when a tag
+          # shares the branch's name (`nightly` is also the pre-release tag).
+          actual=$(git symbolic-ref HEAD 2>/dev/null || echo "DETACHED")
+          expected="refs/heads/${NIGHTLY_BRANCH}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::Expected ${expected}, got '${actual}'."
+            exit 1
+          fi
+          echo "Building ${NIGHTLY_BRANCH} at $(git rev-parse --short HEAD)."
 
       - name: Resolve latest upstream jxl-rs revision
         id: upstream
@@ -69,11 +92,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_BRANCH }}
+          fetch-depth: 0
 
+      # Note: `nightly` is also the name of a pre-release tag. Push the fully
+      # qualified ref so git never has to disambiguate branch from tag.
       - name: Move nightly tag to this commit
         run: |
           git tag -f nightly
-          git push -f origin nightly
+          git push -f origin refs/tags/nightly:refs/tags/nightly
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -87,7 +115,7 @@ jobs:
           tag_name: nightly
           name: Nightly
           body: |
-            Nightly build from the latest upstream `libjxl/jxl-rs` (`main`).
+            Nightly build of the `nightly` branch against the latest upstream `libjxl/jxl-rs` (`main`).
             Pre-release — not intended for production use.
           prerelease: true
           files: |
