@@ -1,0 +1,6 @@
+# Enable x86-64-v3 (AVX2, BMI1, BMI2, FMA, LZCNT, POPCNT — Haswell 2013+ / Ryzen)
+# on x86_64 targets so scalar hot paths in jxl-rs (BitReader peek/consume via
+# BZHI/SHRX, ANS/Huffman LZCNT/TZCNT) and autovectorized loops use modern ISA
+# instructions alongside jxl_simd's runtime dispatch.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
