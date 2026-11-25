@@ -299,7 +299,9 @@ fn main() {
     let st = unsafe { scaled_fn(alpha_fix.as_ref(), 0, 1, 1, &mut alpha_buf, std::ptr::null_mut()) };
     assert_eq!(st, IGStatus::OK as i32);
     assert_eq!((alpha_buf.width, alpha_buf.height), (1, 1));
-    let apx = unsafe { std::slice::from_raw_parts(alpha_buf.data, 4) };
+    let apx: [u8; 4] = unsafe { std::slice::from_raw_parts(alpha_buf.data, 4) }
+        .try_into()
+        .expect("4-byte pixel");
     assert!(apx[0] == 0 && apx[1] == 0 && apx[2] == 255 && (apx[3] as i32 - 128).abs() <= 1,
         "unexpected alpha downscale pixel: {apx:?}");
     unsafe { (codec.free_pixel_buffer.unwrap())(&mut alpha_buf) };
@@ -313,12 +315,25 @@ fn main() {
     let mut prev_16 = IGPixelBuffer::default();
     assert_eq!(unsafe { scaled_fn(prev_fix.as_ref(), 0, 16, 16, &mut prev_16, std::ptr::null_mut()) }, IGStatus::OK as i32);
     assert!(prev_16.width <= 16 && prev_16.height <= 16 && prev_16.width > 0 && prev_16.height > 0);
+    let prev_16_bytes = unsafe { std::slice::from_raw_parts(prev_16.data, (prev_16.height * prev_16.stride) as usize) };
+    assert!(prev_16_bytes.iter().any(|&b| b != 0 && b != 255), "preview 16x16 pixels unexpectedly blank");
     unsafe { (codec.free_pixel_buffer.unwrap())(&mut prev_16) };
     let mut prev_8 = IGPixelBuffer::default();
     assert_eq!(unsafe { scaled_fn(prev_fix.as_ref(), 0, 8, 8, &mut prev_8, std::ptr::null_mut()) }, IGStatus::OK as i32);
     assert!(prev_8.width <= 8 && prev_8.height <= 8 && prev_8.width > 0 && prev_8.height > 0);
+    let prev_8_bytes = unsafe { std::slice::from_raw_parts(prev_8.data, (prev_8.height * prev_8.stride) as usize) };
+    assert!(prev_8_bytes.iter().any(|&b| b != 0 && b != 255), "preview 8x8 pixels unexpectedly blank");
     unsafe { (codec.free_pixel_buffer.unwrap())(&mut prev_8) };
     println!("Embedded preview with_preview.jxl ({}x{}) scaled cleanly (PASS)", prev_info.width, prev_info.height);
+
+    // 8b. Cancellation during 1x1 downscale returns Canceled with no output buffer
+    CANCEL_FLAG.store(1, std::sync::atomic::Ordering::Release);
+    let mut canceled_1x1 = IGPixelBuffer::default();
+    let st = unsafe { scaled_fn(mod_fix.as_ref(), 0, 1, 1, &mut canceled_1x1, cancel_token) };
+    assert_eq!(st, IGStatus::Canceled as i32);
+    assert!(canceled_1x1.data.is_null());
+    CANCEL_FLAG.store(0, std::sync::atomic::Ordering::Release);
+    println!("1x1 downscale cancellation (PASS)");
 
     // 9. [P2 regression] Plugin shutdown callback cleans pooled state and allows clean re-entry/unload
     let shutdown_fn = plugin_api.shutdown.expect("IGPluginApi::shutdown must be registered");
