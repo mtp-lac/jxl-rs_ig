@@ -7,15 +7,14 @@ All notable changes to the JPEG XL Codec Plugin for ImageGlass are listed here.
 A major speed and memory update focused on making large JPEG XL images feel instant to browse and open.
 
 ### Faster image opening
-- **Multi-core decoding:** Images now decode across all available CPU cores instead of a single thread, speeding up full-resolution opening by roughly **5×–6.5×** on multi-core systems.
+- **Multi-core decoding:** Images now decode across all available CPU cores instead of a single thread, speeding up full-resolution opening by roughly **4.4×–6.0×** on multi-core systems while keeping full portable `x86-64` compatibility (`jxl_simd` selects SSE4.2, AVX2, or AVX-512 automatically at runtime).
 - **Direct streaming & native BGRA output:** Removed intermediate file-copy buffering, double header parsing, and the extra RGBA-to-BGRA color swap pass after decoding.
-- **Smarter memory allocation:** Large image buffers are allocated on 64-byte boundaries without a slow upfront zero-fill pass, so worker threads initialize memory in parallel as they render.
-- **Modern x86-64 CPU support:** x86-64 builds now enable `x86-64-v3` instructions (AVX2, BMI2, FMA, LZCNT) for faster entropy decoding.
+- **Single-allocation output buffers:** Output pixel buffers are allocated once on 64-byte base alignment via `alloc_zeroed`, eliminating secondary heap wrapper allocations when handing buffers to ImageGlass.
 
 ### Faster folder browsing & thumbnails
-- **Scaled thumbnail decoding:** Implemented ImageGlass's native scaled decode API (`DecodeStaticRasterScaled`). Thumbnails now use embedded JXL previews when available, stop early on progressive LF data for large opaque images, or downsample in parallel—making thumbnail generation **4.5×–6.2× faster** than full-size decoding before.
-- **Snappier metadata loading:** Folder scans now stop right after reading basic image headers and skip regenerating identical ICC color profiles, cutting metadata load times by **2×–19×**.
-- **Decoder reuse & zero-alloc probes:** A small decoder pool reuses internal scratch buffers between consecutive images, and `.jxl` file extension checks no longer allocate memory.
+- **Scaled thumbnail decoding:** Implemented ImageGlass's native scaled decode API (`DecodeStaticRasterScaled`). Thumbnails use embedded JXL previews when available or parallel full-area box downsampling (with premultiplied-alpha weighting for transparent images), cutting thumbnail work by **4.3×–6.2×** compared to v1.2.0 full-size decoding without downscaling aliasing.
+- **Snappier metadata loading:** Folder scans now stop right after reading basic image headers and skip regenerating identical ICC color profiles, cutting metadata load times by **2.3×–13×**.
+- **Decoder reuse & clean shutdown:** A small decoder pool reuses internal scratch buffers between consecutive images and frees them when ImageGlass unloads the plugin (`shutdown`), while `.jxl` file extension checks no longer allocate memory.
 
 ### Better responsiveness
 - **Faster cancellation:** Cancellation is now checked across worker tasks as well as streaming reads, letting long decodes stop within milliseconds when you switch images.
