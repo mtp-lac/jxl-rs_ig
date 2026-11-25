@@ -69,7 +69,7 @@ The build produces a shared library:
   "id": "Plugin_JxlCodec",
   "name": "JPEG XL Codec",
   "description": "Native codec plugin for JPEG XL (JXL) image format support using jxl-rs decoder",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "JXL Codec Developer",
   "website": "https://github.com/libjxl/jxl-rs",
   "kind": "Codec",

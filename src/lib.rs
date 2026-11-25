@@ -1013,7 +1013,7 @@ fn canceled(token: *mut c_void) -> bool {
 impl PluginState {
     fn new() -> Self {
         let mut strings: Vec<Vec<u16>> =
-            ["Plugin_JxlCodec", "JPEG XL", "2.0.0", "codec_jxl", ".jxl"]
+            ["Plugin_JxlCodec", "JPEG XL", "2.1.0", "codec_jxl", ".jxl"]
                 .iter()
                 .map(|s| s.encode_utf16().collect())
                 .collect();
