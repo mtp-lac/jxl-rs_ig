@@ -11,3 +11,6 @@ CHANGELOG.md
 .idea/
 .vscode/
 *.swp
+
+# Local changelog
+CHANGELOG.md
