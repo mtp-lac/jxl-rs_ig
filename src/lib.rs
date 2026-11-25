@@ -1430,6 +1430,7 @@ fn downscale_bgra8(
     let max_threads = dst_h.div_ceil(8).max(1);
     let sh_128 = sh as u128;
     let dh_128 = dh as u128;
+    let cancel_token = cancel as usize;
 
     let res = runner.run_ordered(dst_h, Some(max_threads), &|dy| {
         let y_start = (dy as u128) * sh_128;
@@ -1453,7 +1454,15 @@ fn downscale_bgra8(
             unsafe { std::slice::from_raw_parts_mut(dst_base.add(dy * dst_stride), dst_stride) };
         if !has_alpha {
             let mut acc = vec![[0u64; 3]; dst_w];
+            let mut polled_pixels = 0usize;
             for sy in sy0..sy1 {
+                polled_pixels += src_w;
+                if polled_pixels >= CANCEL_POLL_BYTES {
+                    polled_pixels = 0;
+                    if canceled(cancel_token as *mut c_void) {
+                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                    }
+                }
                 let wy = if sy == sy0 {
                     wy_first
                 } else if sy + 1 == sy1 {
@@ -1506,7 +1515,15 @@ fn downscale_bgra8(
             }
         } else {
             let mut acc = vec![[0u64; 4]; dst_w];
+            let mut polled_pixels = 0usize;
             for sy in sy0..sy1 {
+                polled_pixels += src_w;
+                if polled_pixels >= CANCEL_POLL_BYTES {
+                    polled_pixels = 0;
+                    if canceled(cancel_token as *mut c_void) {
+                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                    }
+                }
                 let wy = if sy == sy0 {
                     wy_first
                 } else if sy + 1 == sy1 {
@@ -1918,6 +1935,9 @@ unsafe extern "C" fn decode_static_raster_scaled(
             return status;
         }
         drop(full_pixels);
+        if canceled(cancel) {
+            return CANCELED;
+        }
 
         unsafe {
             *out = thumb_pixels.into_pixel_buffer(dst_w, dst_h);
