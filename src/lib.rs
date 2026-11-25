@@ -47,18 +47,13 @@ const METADATA_READ_BUF: usize = 16 * 1024;
 const DECODE_READ_BUF: usize = 1024 * 1024;
 const CANCEL_POLL_BYTES: usize = 1024 * 1024;
 
-/// 64-byte alignment for output pixel buffers (`AlignedBuffer` + `alloc_zeroed`).
+/// 64-byte base alignment for output pixel buffers (`AlignedBuffer` + `alloc_zeroed`).
 const PIXEL_BUFFER_ALIGN: usize = 64;
 
 /// Bounded `JxlDecoder` reuse pool. Retains `BufferRecycler` buckets and thread
 /// scratch buffers across consecutive views without holding huge 16k/32k buffers.
 const MAX_POOLED_DECODERS: usize = 4;
 const DECODER_POOL_MAX_PIXELS: usize = 64 * 1024 * 1024;
-
-/// Bounded progressive-read windows for 1/8x LF early-stop thumbnail decodes.
-const LF_INIT_WINDOW: u64 = 128 * 1024;
-const LF_STEP_WINDOW: u64 = 256 * 1024;
-const LF_PROBE_CAP: u64 = 1024 * 1024;
 
 /// ICC profiles handed to the host through `IGImageInfo`. The ABI only
 /// guarantees the host reads them synchronously inside `LoadMetadata`, so a
@@ -345,7 +340,6 @@ struct FileInput {
     reader: FileReader,
     length: u64,
     pos: u64,
-    window_limit: Option<u64>,
     buf: Vec<u8>,
     buf_cap: usize,
     cursor: usize,
@@ -367,7 +361,6 @@ impl FileInput {
             },
             length,
             pos: 0,
-            window_limit: None,
             buf: Vec::new(),
             buf_cap,
             cursor: 0,
@@ -379,34 +372,19 @@ impl FileInput {
         self.buf_cap = DECODE_READ_BUF;
     }
 
-    fn effective_limit(&self) -> u64 {
-        self.window_limit
-            .map_or(self.length, |w| w.min(self.length))
-    }
-
-    fn set_window_limit(&mut self, limit: Option<u64>) {
-        self.window_limit = limit;
-    }
-
-    fn is_file_exhausted(&self) -> bool {
-        self.cursor >= self.filled && (self.reader.eof || self.pos >= self.length)
-    }
-
     fn is_exhausted(&self) -> bool {
-        self.cursor >= self.filled && (self.reader.eof || self.pos >= self.effective_limit())
+        self.cursor >= self.filled && (self.reader.eof || self.pos >= self.length)
     }
 
     fn rewind_to_start(&mut self) -> std::io::Result<()> {
         if self.pos <= self.cursor as u64 {
             self.cursor -= self.pos as usize;
             self.pos = 0;
-            self.window_limit = None;
             return Ok(());
         }
         self.reader.file.seek(SeekFrom::Start(0))?;
         self.reader.eof = self.length == 0;
         self.pos = 0;
-        self.window_limit = None;
         self.cursor = 0;
         self.filled = 0;
         Ok(())
@@ -415,17 +393,15 @@ impl FileInput {
 
 impl JxlBitstreamInput for FileInput {
     fn available_bytes(&mut self) -> std::io::Result<usize> {
-        let limit = self.effective_limit();
-        if self.cursor >= self.filled && (self.reader.eof || self.pos >= limit) {
+        if self.is_exhausted() {
             Ok(0)
         } else {
-            Ok(limit.saturating_sub(self.pos).min(usize::MAX as u64) as usize)
+            Ok(self.length.saturating_sub(self.pos).min(usize::MAX as u64) as usize)
         }
     }
 
     fn read(&mut self, bufs: &mut [IoSliceMut]) -> std::io::Result<usize> {
         let mut total = 0usize;
-        let limit = self.effective_limit();
         for slice in bufs {
             let mut offset = 0usize;
             while offset < slice.len() {
@@ -444,13 +420,11 @@ impl JxlBitstreamInput for FileInput {
                     }
                     continue;
                 }
-                if self.reader.eof || self.pos >= limit {
-                    if self.pos >= self.length {
-                        self.reader.eof = true;
-                    }
+                if self.reader.eof || self.pos >= self.length {
+                    self.reader.eof = true;
                     return Ok(total);
                 }
-                let rem_limit = limit.saturating_sub(self.pos);
+                let rem_limit = self.length.saturating_sub(self.pos);
                 let rem_slice = slice.len() - offset;
                 if rem_slice >= self.buf_cap {
                     let chunk_len = (rem_slice as u64)
@@ -466,11 +440,7 @@ impl JxlBitstreamInput for FileInput {
                     continue;
                 }
                 let disk_rem = rem_limit.min(usize::MAX as u64) as usize;
-                let want = if self.window_limit.is_some() {
-                    self.buf_cap.min(disk_rem.max(1))
-                } else {
-                    self.buf_cap.min(disk_rem.max(4096))
-                };
+                let want = self.buf_cap.min(disk_rem.max(4096));
                 if self.buf.len() < want {
                     self.buf
                         .try_reserve_exact(want - self.buf.len())
@@ -893,11 +863,12 @@ impl Drop for DecodeRunner {
     }
 }
 
-/// 64-byte aligned, OS demand-zero pixel buffer (`alloc_zeroed`).
+/// 64-byte base-aligned, zero-initialized pixel buffer (`alloc_zeroed`).
 ///
-/// Avoids a synchronous single-threaded `memset` over multi-GB frames, lets
-/// worker threads fault pages in parallel during rendering, and eliminates the
-/// secondary `Box<Vec<u8>>` allocation for `IGPixelBuffer::release_context`.
+/// Uses a single heap allocation whose byte length is stored directly in
+/// `IGPixelBuffer::release_context`, avoiding a secondary `Box<Vec<u8>>`
+/// allocation. Because the ABI requires tight packing (`stride = width * 4`),
+/// only row 0 is guaranteed 64-byte aligned.
 struct AlignedBuffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -1101,7 +1072,7 @@ impl PluginState {
             },
             get_codec,
             initialize: None,
-            shutdown: None,
+            shutdown: Some(plugin_shutdown),
             self_test: None,
         });
         // Keep UTF-16 buffers alive for as long as the ABI tables are reachable.
@@ -1137,6 +1108,21 @@ pub unsafe extern "C" fn ig_plugin_get_api(
         Ok(state) => unsafe { &*(*state).plugin },
         Err(_) => std::ptr::null(),
     }
+}
+
+unsafe extern "C" fn plugin_shutdown() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(state) = STATE.get() {
+            if let Ok(mut pool) = state.decoders.lock() {
+                pool.clear();
+                pool.shrink_to_fit();
+            }
+            if let Ok(mut icc) = state.icc.lock() {
+                *icc = IccStore::default();
+            }
+        }
+        HOST_CORE.store(std::ptr::null_mut(), Ordering::Release);
+    }));
 }
 
 unsafe extern "C" fn get_codec(index: i32, out: *mut *mut IGCodecApi) -> i32 {
@@ -1368,6 +1354,23 @@ impl SendMutPtr {
     }
 }
 
+fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.max(1)
+}
+
+#[derive(Clone, Copy)]
+struct XSpan {
+    sx0: usize,
+    sx1: usize,
+    w_left: u64,
+    w_right: u64,
+}
+
 fn downscale_bgra8(
     src: &[u8],
     src_w: usize,
@@ -1379,86 +1382,216 @@ fn downscale_bgra8(
     runner: &mut DecodeRunner,
     cancel: *mut c_void,
 ) -> Result<(), IGStatus> {
+    let gx = gcd_usize(src_w, dst_w);
+    let sw = src_w / gx;
+    let dw = dst_w / gx;
+    let dw_u64 = dw as u64;
+    let sw_u64 = sw as u64;
+
+    let gy = gcd_usize(src_h, dst_h);
+    let sh = src_h / gy;
+    let dh = dst_h / gy;
+    let dh_u64 = dh as u64;
+    let sh_u64 = sh as u64;
+
+    let total_weight = sw_u64 * sh_u64;
+    let half_weight = total_weight / 2;
+
+    let mut x_spans = Vec::with_capacity(dst_w);
+    let sw_128 = sw as u128;
+    let dw_128 = dw as u128;
+    for dx in 0..dst_w {
+        let x_start = (dx as u128) * sw_128;
+        let x_end = ((dx + 1) as u128) * sw_128;
+        let sx0 = (x_start / dw_128) as usize;
+        let sx1 = x_end.div_ceil(dw_128) as usize;
+        if sx0 + 1 == sx1 {
+            x_spans.push(XSpan {
+                sx0,
+                sx1,
+                w_left: sw_u64,
+                w_right: 0,
+            });
+        } else {
+            let w_left = (dw_128 - (x_start % dw_128)) as u64;
+            let w_right = (x_end - ((sx1 - 1) as u128) * dw_128) as u64;
+            x_spans.push(XSpan {
+                sx0,
+                sx1,
+                w_left,
+                w_right,
+            });
+        }
+    }
+
     let src_stride = src_w * 4;
     let dst_stride = dst_w * 4;
-    let mut x_spans = Vec::with_capacity(dst_w);
-    for dx in 0..dst_w {
-        let x0 = (dx * src_w) / dst_w;
-        let x1 = (((dx + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
-        let step_x = ((x1 - x0) / 8).max(1);
-        x_spans.push((x0, x1, step_x));
-    }
     let dst_base = SendMutPtr(dst.as_mut_ptr());
-    let max_threads = dst_h.div_ceil(16).max(1);
+    let max_threads = dst_h.div_ceil(8).max(1);
+    let sh_128 = sh as u128;
+    let dh_128 = dh as u128;
+    let cancel_token = cancel as usize;
+
     let res = runner.run_ordered(dst_h, Some(max_threads), &|dy| {
-        let y0 = (dy * src_h) / dst_h;
-        let y1 = (((dy + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
-        let step_y = ((y1 - y0) / 8).max(1);
+        let y_start = (dy as u128) * sh_128;
+        let y_end = ((dy + 1) as u128) * sh_128;
+        let sy0 = (y_start / dh_128) as usize;
+        let sy1 = y_end.div_ceil(dh_128) as usize;
+        let single_row = sy0 + 1 == sy1;
+        let wy_first = if single_row {
+            sh_u64
+        } else {
+            (dh_128 - (y_start % dh_128)) as u64
+        };
+        let wy_last = if single_row {
+            0
+        } else {
+            (y_end - ((sy1 - 1) as u128) * dh_128) as u64
+        };
+
         // SAFETY: each `dy` writes strictly to its own disjoint row `dy * dst_stride`.
-        let dst_row = unsafe { std::slice::from_raw_parts_mut(dst_base.add(dy * dst_stride), dst_stride) };
+        let dst_row =
+            unsafe { std::slice::from_raw_parts_mut(dst_base.add(dy * dst_stride), dst_stride) };
         if !has_alpha {
-            for (dx, &(x0, x1, step_x)) in x_spans.iter().enumerate() {
-                let mut sum_b = 0u32;
-                let mut sum_g = 0u32;
-                let mut sum_r = 0u32;
-                let mut count = 0u32;
-                let mut sy = y0;
-                while sy < y1 {
-                    let row = &src[sy * src_stride..(sy + 1) * src_stride];
-                    let mut sx = x0;
-                    while sx < x1 {
-                        let off = sx * 4;
-                        sum_b += row[off] as u32;
-                        sum_g += row[off + 1] as u32;
-                        sum_r += row[off + 2] as u32;
-                        count += 1;
-                        sx += step_x;
+            let mut acc = vec![[0u64; 3]; dst_w];
+            let mut polled_pixels = 0usize;
+            for sy in sy0..sy1 {
+                polled_pixels += src_w;
+                if polled_pixels >= CANCEL_POLL_BYTES {
+                    polled_pixels = 0;
+                    if canceled(cancel_token as *mut c_void) {
+                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
                     }
-                    sy += step_y;
                 }
-                let half = count / 2;
-                let out = dx * 4;
-                dst_row[out] = ((sum_b + half) / count) as u8;
-                dst_row[out + 1] = ((sum_g + half) / count) as u8;
-                dst_row[out + 2] = ((sum_r + half) / count) as u8;
-                dst_row[out + 3] = 255;
+                let wy = if sy == sy0 {
+                    wy_first
+                } else if sy + 1 == sy1 {
+                    wy_last
+                } else {
+                    dh_u64
+                };
+                let row = &src[sy * src_stride..(sy + 1) * src_stride];
+                for (dst_px, span) in acc.iter_mut().zip(x_spans.iter()) {
+                    let p0 = span.sx0 * 4;
+                    let (rb, rg, rr) = if span.sx0 + 1 == span.sx1 {
+                        (
+                            (row[p0] as u64) * span.w_left,
+                            (row[p0 + 1] as u64) * span.w_left,
+                            (row[p0 + 2] as u64) * span.w_left,
+                        )
+                    } else {
+                        let mut mid_b = 0u64;
+                        let mut mid_g = 0u64;
+                        let mut mid_r = 0u64;
+                        let mid = &row[(span.sx0 + 1) * 4..(span.sx1 - 1) * 4];
+                        for px in mid.chunks_exact(4) {
+                            mid_b += px[0] as u64;
+                            mid_g += px[1] as u64;
+                            mid_r += px[2] as u64;
+                        }
+                        let pr = (span.sx1 - 1) * 4;
+                        (
+                            (row[p0] as u64) * span.w_left
+                                + mid_b * dw_u64
+                                + (row[pr] as u64) * span.w_right,
+                            (row[p0 + 1] as u64) * span.w_left
+                                + mid_g * dw_u64
+                                + (row[pr + 1] as u64) * span.w_right,
+                            (row[p0 + 2] as u64) * span.w_left
+                                + mid_r * dw_u64
+                                + (row[pr + 2] as u64) * span.w_right,
+                        )
+                    };
+                    dst_px[0] += rb * wy;
+                    dst_px[1] += rg * wy;
+                    dst_px[2] += rr * wy;
+                }
+            }
+            for (dst_px, out) in acc.iter().zip(dst_row.chunks_exact_mut(4)) {
+                out[0] = ((dst_px[0] + half_weight) / total_weight) as u8;
+                out[1] = ((dst_px[1] + half_weight) / total_weight) as u8;
+                out[2] = ((dst_px[2] + half_weight) / total_weight) as u8;
+                out[3] = 255;
             }
         } else {
-            for (dx, &(x0, x1, step_x)) in x_spans.iter().enumerate() {
-                let mut sum_ba = 0u64;
-                let mut sum_ga = 0u64;
-                let mut sum_ra = 0u64;
-                let mut sum_a = 0u64;
-                let mut count = 0u64;
-                let mut sy = y0;
-                while sy < y1 {
-                    let row = &src[sy * src_stride..(sy + 1) * src_stride];
-                    let mut sx = x0;
-                    while sx < x1 {
-                        let off = sx * 4;
-                        let a = row[off + 3] as u64;
-                        sum_ba += (row[off] as u64) * a;
-                        sum_ga += (row[off + 1] as u64) * a;
-                        sum_ra += (row[off + 2] as u64) * a;
-                        sum_a += a;
-                        count += 1;
-                        sx += step_x;
+            let mut acc = vec![[0u64; 4]; dst_w];
+            let mut polled_pixels = 0usize;
+            for sy in sy0..sy1 {
+                polled_pixels += src_w;
+                if polled_pixels >= CANCEL_POLL_BYTES {
+                    polled_pixels = 0;
+                    if canceled(cancel_token as *mut c_void) {
+                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
                     }
-                    sy += step_y;
                 }
-                let out = dx * 4;
-                let out_a = ((sum_a + count / 2) / count) as u8;
+                let wy = if sy == sy0 {
+                    wy_first
+                } else if sy + 1 == sy1 {
+                    wy_last
+                } else {
+                    dh_u64
+                };
+                let row = &src[sy * src_stride..(sy + 1) * src_stride];
+                for (dst_px, span) in acc.iter_mut().zip(x_spans.iter()) {
+                    let p0 = span.sx0 * 4;
+                    let a0 = row[p0 + 3] as u64;
+                    let (rba, rga, rra, ra) = if span.sx0 + 1 == span.sx1 {
+                        let wa = span.w_left * a0;
+                        (
+                            (row[p0] as u64) * wa,
+                            (row[p0 + 1] as u64) * wa,
+                            (row[p0 + 2] as u64) * wa,
+                            wa,
+                        )
+                    } else {
+                        let mut mid_ba = 0u64;
+                        let mut mid_ga = 0u64;
+                        let mut mid_ra = 0u64;
+                        let mut mid_a = 0u64;
+                        let mid = &row[(span.sx0 + 1) * 4..(span.sx1 - 1) * 4];
+                        for px in mid.chunks_exact(4) {
+                            let a = px[3] as u64;
+                            mid_ba += (px[0] as u64) * a;
+                            mid_ga += (px[1] as u64) * a;
+                            mid_ra += (px[2] as u64) * a;
+                            mid_a += a;
+                        }
+                        let wa0 = span.w_left * a0;
+                        let pr = (span.sx1 - 1) * 4;
+                        let war = span.w_right * (row[pr + 3] as u64);
+                        (
+                            (row[p0] as u64) * wa0
+                                + mid_ba * dw_u64
+                                + (row[pr] as u64) * war,
+                            (row[p0 + 1] as u64) * wa0
+                                + mid_ga * dw_u64
+                                + (row[pr + 1] as u64) * war,
+                            (row[p0 + 2] as u64) * wa0
+                                + mid_ra * dw_u64
+                                + (row[pr + 2] as u64) * war,
+                            wa0 + mid_a * dw_u64 + war,
+                        )
+                    };
+                    dst_px[0] += rba * wy;
+                    dst_px[1] += rga * wy;
+                    dst_px[2] += rra * wy;
+                    dst_px[3] += ra * wy;
+                }
+            }
+            for (dst_px, out) in acc.iter().zip(dst_row.chunks_exact_mut(4)) {
+                let sum_a = dst_px[3];
+                let out_a = ((sum_a + half_weight) / total_weight).min(255) as u8;
                 if sum_a > 0 {
                     let half_a = sum_a / 2;
-                    dst_row[out] = ((sum_ba + half_a) / sum_a).min(255) as u8;
-                    dst_row[out + 1] = ((sum_ga + half_a) / sum_a).min(255) as u8;
-                    dst_row[out + 2] = ((sum_ra + half_a) / sum_a).min(255) as u8;
+                    out[0] = ((dst_px[0] + half_a) / sum_a).min(255) as u8;
+                    out[1] = ((dst_px[1] + half_a) / sum_a).min(255) as u8;
+                    out[2] = ((dst_px[2] + half_a) / sum_a).min(255) as u8;
                 } else {
-                    dst_row[out] = 0;
-                    dst_row[out + 1] = 0;
-                    dst_row[out + 2] = 0;
+                    out[0] = 0;
+                    out[1] = 0;
+                    out[2] = 0;
                 }
-                dst_row[out + 3] = out_a;
+                out[3] = out_a;
             }
         }
         Ok(())
@@ -1467,91 +1600,6 @@ fn downscale_bgra8(
         Ok(()) => Ok(()),
         Err(_) if runner.was_canceled() || canceled(cancel) => Err(CANCELED),
         Err(_) => Err(DECODE_FAILED),
-    }
-}
-
-fn decode_lf_early_or_full(
-    decoder: &mut JxlDecoder,
-    input: &mut FileInput,
-    pixels: &mut AlignedBuffer,
-    width: usize,
-    height: usize,
-    extra_channels: usize,
-    runner: &mut DecodeRunner,
-    cancel: *mut c_void,
-) -> Result<(), IGStatus> {
-    input.set_decode_mode();
-    if decoder
-        .set_pixel_format(bgra8_pixel_format(extra_channels))
-        .is_err()
-    {
-        return Err(DECODE_FAILED);
-    }
-    let mut out_buf = [pixels.as_output_buffer(height, width * 4)];
-    let mut window = input.pos.saturating_add(LF_INIT_WINDOW).min(input.length);
-    let mut probing = window < input.length;
-    if probing {
-        input.set_window_limit(Some(window));
-    }
-
-    let mut frame_complete = false;
-    let res = loop {
-        if canceled(cancel) {
-            break Err(CANCELED);
-        }
-        match decoder.process(input, Some(&mut out_buf), Some(runner)) {
-            Ok(Event::FrameHeader) => {}
-            Ok(Event::FrameComplete { .. }) => {
-                frame_complete = true;
-                break Ok(());
-            }
-            Ok(Event::Complete) => break Ok(()),
-            Ok(Event::NeedMoreInput { .. }) => {
-                if input.is_file_exhausted() {
-                    break Err(DECODE_FAILED);
-                }
-                if probing {
-                    match decoder.flush_pixels(&mut out_buf, Some(runner)) {
-                        Ok(true) => {
-                            frame_complete = true;
-                            break Ok(());
-                        }
-                        Ok(false) => {
-                            window = window.saturating_add(LF_STEP_WINDOW).min(input.length);
-                            if window >= input.length || window >= LF_PROBE_CAP {
-                                probing = false;
-                                input.set_window_limit(None);
-                            } else {
-                                input.set_window_limit(Some(window));
-                            }
-                        }
-                        Err(err) => {
-                            if runner.was_canceled() {
-                                break Err(CANCELED);
-                            }
-                            break Err(map_jxl_err(err, input, cancel));
-                        }
-                    }
-                }
-            }
-            Ok(Event::BasicInfo) => break Err(DECODE_FAILED),
-            Err(err) => {
-                if runner.was_canceled() {
-                    break Err(CANCELED);
-                }
-                break Err(map_jxl_err(err, input, cancel));
-            }
-        }
-    };
-    input.set_window_limit(None);
-    res?;
-    if canceled(cancel) {
-        return Err(CANCELED);
-    }
-    if frame_complete {
-        Ok(())
-    } else {
-        Err(DECODE_FAILED)
     }
 }
 
@@ -1860,34 +1908,16 @@ unsafe extern "C" fn decode_static_raster_scaled(
         };
 
         let mut runner = DecodeRunner::new(cancel);
-        let try_lf_early = !alpha
-            && extra_channels == 0
-            && dst_w.saturating_mul(8) <= width
-            && dst_h.saturating_mul(8) <= height;
-        let decode_res = if try_lf_early {
-            decode_lf_early_or_full(
-                &mut decoder,
-                &mut input,
-                &mut full_pixels,
-                width,
-                height,
-                extra_channels,
-                &mut runner,
-                cancel,
-            )
-        } else {
-            decode_full_frame(
-                &mut decoder,
-                &mut input,
-                &mut full_pixels,
-                width,
-                height,
-                extra_channels,
-                &mut runner,
-                cancel,
-            )
-        };
-        if let Err(status) = decode_res {
+        if let Err(status) = decode_full_frame(
+            &mut decoder,
+            &mut input,
+            &mut full_pixels,
+            width,
+            height,
+            extra_channels,
+            &mut runner,
+            cancel,
+        ) {
             return status;
         }
 
@@ -1905,6 +1935,9 @@ unsafe extern "C" fn decode_static_raster_scaled(
             return status;
         }
         drop(full_pixels);
+        if canceled(cancel) {
+            return CANCELED;
+        }
 
         unsafe {
             *out = thumb_pixels.into_pixel_buffer(dst_w, dst_h);

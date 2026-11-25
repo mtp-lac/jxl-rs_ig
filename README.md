@@ -7,8 +7,7 @@ This plugin implements a native codec for ImageGlass 10 that adds support for JP
 - Decodes static JPEG XL images (.jxl extension)
 - Multi-threaded decoding across all available CPU cores via `JxlParallelRunner`
 - Fast scaled thumbnail decoding (`decode_static_raster_scaled`) using embedded
-  previews, 1/8× LF progressive early-stop for opaque images, and parallel box
-  downsampling
+  previews when available and parallel full-area box downsampling
 - Extracts image metadata (dimensions, color space, alpha channel)
 - Reports frame count for static images
 - Supports cancellation during metadata and decode operations (polled across input
@@ -16,8 +15,9 @@ This plugin implements a native codec for ImageGlass 10 that adds support for JP
 - Streaming `JxlBitstreamInput`: metadata loads stop at `Event::BasicInfo` and
   decodes stream directly into `jxl-rs` section buffers without retaining the
   file in memory
-- 64-byte aligned, OS demand-zero output buffers (`alloc_zeroed`) and a bounded
-  `JxlDecoder` reuse pool for lower latency across consecutive image loads
+- 64-byte base-aligned zero-initialized output buffers (`alloc_zeroed`) and a
+  bounded `JxlDecoder` reuse pool (cleaned up via `shutdown` before DLL unload)
+  for lower latency across consecutive image loads
 - Bounded, de-duplicated ICC profile cache — browsing thousands of files does
   not accumulate memory
 - Size guards: frames above 32000×32000 are refused, and huge allocations are
@@ -94,9 +94,10 @@ from `FileInput` (`JxlBitstreamInput`): `load_metadata` stops as soon as
 `Event::BasicInfo` fires (avoiding frame/pipeline allocation), and
 `decode_static_raster` streams directly into `jxl-rs` sections while running
 decoding and SIMD BGRA8 rendering across a `JxlParallelRunner` worker pool.
-`decode_static_raster_scaled` uses embedded previews when available, 1/8× LF
-early-stop for opaque images, and parallel box downsampling into the target box.
-ICC profiles returned through `IGImageInfo.IccProfileData` are kept in a
+`decode_static_raster_scaled` uses embedded previews when available and parallel
+full-area box downsampling (with premultiplied-alpha weighting) into the target
+box. `shutdown` clears pooled decoders and cached ICC profiles before library
+unload. ICC profiles returned through `IGImageInfo.IccProfileData` are kept in a
 de-duplicated, bounded store (identical profiles and `JxlColorEncoding` entries
 share one allocation; the store caps out at 64 profiles / 4 MiB with FIFO
 eviction) — the ABI only requires the host to read the profile synchronously

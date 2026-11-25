@@ -241,6 +241,112 @@ fn main() {
         unsafe { (codec.free_pixel_buffer.unwrap())(&mut full_again) };
     }
 
+    // Helper for temporary fixture paths backed by embedded test assets
+    struct TempFixture(std::path::PathBuf, Vec<u16>);
+    impl TempFixture {
+        fn new(name: &str, bytes: &[u8]) -> Self {
+            let p = std::env::temp_dir().join(format!("jxl_ig_test_{name}"));
+            std::fs::write(&p, bytes).expect("write fixture");
+            let w = to_wide(p.to_str().unwrap());
+            Self(p, w)
+        }
+        fn as_ref(&self) -> IGStringRef {
+            IGStringRef { data: self.1.as_ptr(), length: self.1.len() as i32 }
+        }
+    }
+    impl Drop for TempFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // 5. [P1 regression] 2048x2048 opaque Modular gradient scaled to 256x256 has zero black pixels
+    let mod_fix = TempFixture::new("modular_2048.jxl", include_bytes!("../fixtures/modular_2048.jxl"));
+    let mut mod_scaled = IGPixelBuffer::default();
+    let st = unsafe { scaled_fn(mod_fix.as_ref(), 0, 256, 256, &mut mod_scaled, std::ptr::null_mut()) };
+    assert_eq!(st, IGStatus::OK as i32);
+    assert_eq!((mod_scaled.width, mod_scaled.height), (256, 256));
+    let mod_bytes = unsafe { std::slice::from_raw_parts(mod_scaled.data, 256 * 256 * 4) };
+    let black_px = mod_bytes.chunks_exact(4).filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0).count();
+    assert_eq!(black_px, 0, "unexpected black pixels in 2048x2048 modular thumbnail");
+    // Top row (~#4080C0 -> BGRA [0xC0, 0x80, 0x40, 0xFF]) & bottom row (~#C08040 -> BGRA [0x40, 0x80, 0xC0, 0xFF])
+    assert!((mod_bytes[0] as i32 - 0xC0).abs() <= 4 && (mod_bytes[2] as i32 - 0x40).abs() <= 4);
+    let last_off = (256 * 256 - 1) * 4;
+    assert!((mod_bytes[last_off] as i32 - 0x40).abs() <= 4 && (mod_bytes[last_off + 2] as i32 - 0xC0).abs() <= 4);
+    unsafe { (codec.free_pixel_buffer.unwrap())(&mut mod_scaled) };
+    println!("Modular 2048x2048 -> 256x256 thumbnail: 0 black pixels (PASS)");
+
+    // 6. [P2 regression] 1024x1024 alternating 1px black/white columns downscales to uniform gray (no aliasing)
+    let stripe_fix = TempFixture::new("stripes_1024.jxl", include_bytes!("../fixtures/stripes_1024.jxl"));
+    for (target_dim, tol) in [(64, 1), (100, 8)] {
+        let mut stripe_buf = IGPixelBuffer::default();
+        let st = unsafe { scaled_fn(stripe_fix.as_ref(), 0, target_dim, target_dim, &mut stripe_buf, std::ptr::null_mut()) };
+        assert_eq!(st, IGStatus::OK as i32);
+        assert_eq!((stripe_buf.width, stripe_buf.height), (target_dim, target_dim));
+        let len = (stripe_buf.width * stripe_buf.height * 4) as usize;
+        let data = unsafe { std::slice::from_raw_parts(stripe_buf.data, len) };
+        for px in data.chunks_exact(4) {
+            assert!((px[0] as i32 - 128).abs() <= tol && (px[1] as i32 - 128).abs() <= tol && (px[2] as i32 - 128).abs() <= tol && px[3] == 255,
+                "aliasing detected at {target_dim}x{target_dim}: got pixel {px:?}");
+        }
+        unsafe { (codec.free_pixel_buffer.unwrap())(&mut stripe_buf) };
+    }
+    println!("Stripes 1024x1024 -> 64x64 & 100x100 anti-aliased box average (PASS)");
+
+    // 7. Premultiplied alpha box downscaling prevents dark transparent-black fringing
+    let alpha_fix = TempFixture::new("alpha_16.jxl", include_bytes!("../fixtures/alpha_16.jxl"));
+    let mut alpha_buf = IGPixelBuffer::default();
+    let st = unsafe { scaled_fn(alpha_fix.as_ref(), 0, 1, 1, &mut alpha_buf, std::ptr::null_mut()) };
+    assert_eq!(st, IGStatus::OK as i32);
+    assert_eq!((alpha_buf.width, alpha_buf.height), (1, 1));
+    let apx: [u8; 4] = unsafe { std::slice::from_raw_parts(alpha_buf.data, 4) }
+        .try_into()
+        .expect("4-byte pixel");
+    assert!(apx[0] == 0 && apx[1] == 0 && apx[2] == 255 && (apx[3] as i32 - 128).abs() <= 1,
+        "unexpected alpha downscale pixel: {apx:?}");
+    unsafe { (codec.free_pixel_buffer.unwrap())(&mut alpha_buf) };
+    println!("Alpha premultiplied 16x16 -> 1x1: {apx:?} (PASS)");
+
+    // 8. Embedded preview fast path verification (16x16 preview frame inside larger image)
+    let prev_fix = TempFixture::new("with_preview.jxl", include_bytes!("../fixtures/with_preview.jxl"));
+    let mut prev_info = IGImageInfo::default();
+    assert_eq!(unsafe { (codec.load_metadata.unwrap())(prev_fix.as_ref(), &mut prev_info, std::ptr::null_mut()) }, IGStatus::OK as i32);
+    assert!(prev_info.width > 16 && prev_info.height > 16);
+    let mut prev_16 = IGPixelBuffer::default();
+    assert_eq!(unsafe { scaled_fn(prev_fix.as_ref(), 0, 16, 16, &mut prev_16, std::ptr::null_mut()) }, IGStatus::OK as i32);
+    assert!(prev_16.width <= 16 && prev_16.height <= 16 && prev_16.width > 0 && prev_16.height > 0);
+    let prev_16_bytes = unsafe { std::slice::from_raw_parts(prev_16.data, (prev_16.height * prev_16.stride) as usize) };
+    assert!(prev_16_bytes.iter().any(|&b| b != 0 && b != 255), "preview 16x16 pixels unexpectedly blank");
+    unsafe { (codec.free_pixel_buffer.unwrap())(&mut prev_16) };
+    let mut prev_8 = IGPixelBuffer::default();
+    assert_eq!(unsafe { scaled_fn(prev_fix.as_ref(), 0, 8, 8, &mut prev_8, std::ptr::null_mut()) }, IGStatus::OK as i32);
+    assert!(prev_8.width <= 8 && prev_8.height <= 8 && prev_8.width > 0 && prev_8.height > 0);
+    let prev_8_bytes = unsafe { std::slice::from_raw_parts(prev_8.data, (prev_8.height * prev_8.stride) as usize) };
+    assert!(prev_8_bytes.iter().any(|&b| b != 0 && b != 255), "preview 8x8 pixels unexpectedly blank");
+    unsafe { (codec.free_pixel_buffer.unwrap())(&mut prev_8) };
+    println!("Embedded preview with_preview.jxl ({}x{}) scaled cleanly (PASS)", prev_info.width, prev_info.height);
+
+    // 8b. Cancellation during 1x1 downscale returns Canceled with no output buffer
+    CANCEL_FLAG.store(1, std::sync::atomic::Ordering::Release);
+    let mut canceled_1x1 = IGPixelBuffer::default();
+    let st = unsafe { scaled_fn(mod_fix.as_ref(), 0, 1, 1, &mut canceled_1x1, cancel_token) };
+    assert_eq!(st, IGStatus::Canceled as i32);
+    assert!(canceled_1x1.data.is_null());
+    CANCEL_FLAG.store(0, std::sync::atomic::Ordering::Release);
+    println!("1x1 downscale cancellation (PASS)");
+
+    // 9. [P2 regression] Plugin shutdown callback cleans pooled state and allows clean re-entry/unload
+    let shutdown_fn = plugin_api.shutdown.expect("IGPluginApi::shutdown must be registered");
+    unsafe { shutdown_fn() };
+    let plugin_api_2 = unsafe { get_api(1_002_000, &host_api) };
+    assert!(!plugin_api_2.is_null(), "plugin re-init after shutdown failed");
+    let mut full_after_shutdown = IGPixelBuffer::default();
+    assert_eq!(unsafe { (codec.decode_static_raster.unwrap())(path_ref, 0, &mut full_after_shutdown, std::ptr::null_mut()) }, IGStatus::OK as i32);
+    unsafe { (codec.free_pixel_buffer.unwrap())(&mut full_after_shutdown) };
+    unsafe { shutdown_fn() };
+    drop(lib);
+    println!("Shutdown cleanup & DLL unload (PASS)");
+
     // Silence unused variants check while keeping ABI status enum complete
     let _ = (
         IGStatus::Unsupported,
