@@ -5,6 +5,7 @@
 # Local scratch / dev tooling
 /probe/
 REPORT-*.md
+CHANGELOG.md
 
 # IDE
 .idea/
