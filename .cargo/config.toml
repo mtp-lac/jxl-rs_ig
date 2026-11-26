@@ -1,0 +1,7 @@
+# Default x86_64 builds target baseline x86-64 so release artifacts work on all
+# 64-bit CPUs without SIGILL crashes; `jxl_simd` still performs runtime AVX2 /
+# AVX-512 dispatch on supported hardware.
+#
+# For an opt-in x86-64-v3 (AVX2, BMI1, BMI2, FMA, LZCNT, POPCNT) build, pass:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+

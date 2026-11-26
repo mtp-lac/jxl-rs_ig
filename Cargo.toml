@@ -1,14 +1,21 @@
 [package]
 name = "jxl_codec"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2021"
 authors = ["JXL Codec Developer"]
 description = "JPEG XL codec plugin for ImageGlass using jxl-rs"
 license = "BSD-3-Clause"
+# `tests/` is a standalone ABI harness package with its own Cargo.toml.
+autotests = false
 
 [lib]
 name = "jxl_codec"
 crate-type = ["cdylib"]
+
+[features]
+# Enabled by nightly CI when building against upstream libjxl/jxl-rs `main`
+# where `JxlColorProfile::try_as_icc` takes an `intensity_target: f32` argument.
+upstream-jxl-icc-target = []
 
 [dependencies]
 jxl = "=0.8.0"
