@@ -2,9 +2,9 @@
 #![allow(non_snake_case)]
 
 use jxl::api::{
-    check_signature, Event, ExtraChannel, JxlBasicInfo, JxlBitstreamInput, JxlColorEncoding,
-    JxlColorProfile, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
-    JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlSignature,
+    check_signature, AlphaMode, Event, ExtraChannel, JxlBasicInfo, JxlBitstreamInput,
+    JxlColorEncoding, JxlColorProfile, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions,
+    JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlSignature,
 };
 use jxl::error::Error as JxlError;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -20,6 +20,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 unsafe impl Sync for PluginState {}
 unsafe impl Send for PluginState {}
@@ -47,7 +48,7 @@ const METADATA_READ_BUF: usize = 16 * 1024;
 const DECODE_READ_BUF: usize = 1024 * 1024;
 const CANCEL_POLL_BYTES: usize = 1024 * 1024;
 
-/// 64-byte base alignment for output pixel buffers (`AlignedBuffer` + `alloc_zeroed`).
+/// 64-byte alignment for output pixel buffers (`AlignedBuffer` + `alloc_zeroed`).
 const PIXEL_BUFFER_ALIGN: usize = 64;
 
 /// Bounded `JxlDecoder` reuse pool. Retains `BufferRecycler` buckets and thread
@@ -55,13 +56,15 @@ const PIXEL_BUFFER_ALIGN: usize = 64;
 const MAX_POOLED_DECODERS: usize = 4;
 const DECODER_POOL_MAX_PIXELS: usize = 64 * 1024 * 1024;
 
-/// ICC profiles handed to the host through `IGImageInfo`. The ABI only
-/// guarantees the host reads them synchronously inside `LoadMetadata`, so a
-/// small, de-duplicated store is enough — identical profiles (the common case
-/// while browsing a folder) share one allocation instead of growing a
-/// process-lifetime `Vec` on every call.
+/// ICC profiles handed to the host through `IGImageInfo`. ImageGlass copies the
+/// profile bytes after `LoadMetadata` returns and may issue concurrent metadata
+/// loads, so evicted buffers are held in a bounded retirement queue for
+/// `ICC_RETIRE_GRACE` before being freed. Individual profiles above
+/// `ICC_MAX_BYTES` are not retained.
 const ICC_MAX_PROFILES: usize = 64;
 const ICC_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ICC_RETIRE_GRACE: Duration = Duration::from_secs(10);
+const ICC_RETIRED_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 type IGStatus = i32;
 const OK: IGStatus = 0;
@@ -72,6 +75,9 @@ const DECODE_FAILED: IGStatus = 4;
 const OUT_OF_MEMORY: IGStatus = 5;
 const INTERNAL: IGStatus = 6;
 const IO_ERROR: IGStatus = 8;
+
+const LOG_WARN: i32 = 1;
+const LOG_ERROR: i32 = 2;
 
 /// Available physical memory, in bytes; `usize::MAX` if the query fails, which
 /// keeps decoding rather than blocking on a platform we cannot measure.
@@ -129,32 +135,75 @@ fn available_physical_bytes() -> usize {
     usize::MAX
 }
 
-/// macOS: total physical memory via `sysctlbyname("hw.memsize")`.
+/// macOS: available physical memory via Mach `host_statistics64(HOST_VM_INFO64)`.
 #[cfg(target_os = "macos")]
 fn available_physical_bytes() -> usize {
-    use std::ffi::{c_char, c_int, c_void};
+    use std::ffi::c_int;
+    const HOST_VM_INFO64: c_int = 4;
+    const KERN_SUCCESS: c_int = 0;
+
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct VmStatistics64 {
+        free_count: u32,
+        active_count: u32,
+        inactive_count: u32,
+        wire_count: u32,
+        zero_fill_count: u64,
+        reactivations: u64,
+        pageins: u64,
+        pageouts: u64,
+        faults: u64,
+        cow_faults: u64,
+        lookups: u64,
+        hits: u64,
+        purges: u64,
+        purgeable_count: u32,
+        speculative_count: u32,
+        decompressions: u64,
+        compressions: u64,
+        swapins: u64,
+        swapouts: u64,
+        compressor_page_count: u32,
+        throttled_count: u32,
+        external_page_count: u32,
+        internal_page_count: u32,
+        total_uncompressed_pages_in_compressor: u64,
+    }
+
     extern "C" {
-        fn sysctlbyname(
-            name: *const c_char,
-            oldp: *mut c_void,
-            oldlenp: *mut usize,
-            newp: *const c_void,
-            newlen: usize,
+        fn mach_host_self() -> u32;
+        fn host_page_size(host: u32, out_page_size: *mut usize) -> c_int;
+        fn host_statistics64(
+            host_priv: u32,
+            flavor: c_int,
+            host_info_out: *mut i32,
+            host_info_out_cnt: *mut u32,
         ) -> c_int;
     }
-    let mut memsize: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
+
+    let host = unsafe { mach_host_self() };
+    let mut page_size: usize = 0;
+    if unsafe { host_page_size(host, &mut page_size) } != KERN_SUCCESS || page_size == 0 {
+        return usize::MAX;
+    }
+    let mut stats = VmStatistics64::default();
+    let mut count = (std::mem::size_of::<VmStatistics64>() / std::mem::size_of::<u32>()) as u32;
     let ok = unsafe {
-        sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut memsize as *mut u64).cast(),
-            &mut len,
-            std::ptr::null(),
-            0,
+        host_statistics64(
+            host,
+            HOST_VM_INFO64,
+            std::ptr::addr_of_mut!(stats).cast(),
+            &mut count,
         )
     };
-    if ok == 0 && len == std::mem::size_of::<u64>() {
-        memsize as usize
+    if ok == KERN_SUCCESS {
+        let avail_pages = (stats.free_count as u64)
+            .saturating_add((stats.inactive_count as u64).max(stats.purgeable_count as u64));
+        avail_pages
+            .saturating_mul(page_size as u64)
+            .min(usize::MAX as u64) as usize
     } else {
         usize::MAX
     }
@@ -372,6 +421,10 @@ impl FileInput {
         self.buf_cap = DECODE_READ_BUF;
     }
 
+    fn compressed_margin(&self) -> usize {
+        self.length.min(usize::MAX as u64) as usize
+    }
+
     fn is_exhausted(&self) -> bool {
         self.cursor >= self.filled && (self.reader.eof || self.pos >= self.length)
     }
@@ -393,7 +446,7 @@ impl FileInput {
 
 impl JxlBitstreamInput for FileInput {
     fn available_bytes(&mut self) -> std::io::Result<usize> {
-        if self.is_exhausted() {
+        if self.cursor >= self.filled && (self.reader.eof || self.pos >= self.length) {
             Ok(0)
         } else {
             Ok(self.length.saturating_sub(self.pos).min(usize::MAX as u64) as usize)
@@ -430,7 +483,9 @@ impl JxlBitstreamInput for FileInput {
                     let chunk_len = (rem_slice as u64)
                         .min(rem_limit)
                         .min(CANCEL_POLL_BYTES as u64) as usize;
-                    let n = self.reader.read_raw(&mut slice[offset..offset + chunk_len])?;
+                    let n = self
+                        .reader
+                        .read_raw(&mut slice[offset..offset + chunk_len])?;
                     if n == 0 {
                         return Ok(total);
                     }
@@ -492,20 +547,56 @@ impl JxlBitstreamInput for FileInput {
 
 /// Bounded, de-duplicated ICC profile store. Boxes are heap-pinned, so their
 /// pointers stay valid for as long as the entry lives; identical profiles share
-/// one allocation. Entries are evicted FIFO when the store exceeds
-/// `ICC_MAX_PROFILES` profiles or `ICC_MAX_BYTES` bytes. Also caches simple
-/// `JxlColorEncoding` descriptors to avoid regenerating ICC bytes and MD5 sums.
+/// one allocation. Entries are evicted LRU when the store exceeds
+/// `ICC_MAX_PROFILES` profiles or `ICC_MAX_BYTES` bytes, and evicted buffers are
+/// held in `retired` for `ICC_RETIRE_GRACE` so concurrent host copies cannot
+/// read freed memory. Also caches simple `JxlColorEncoding` descriptors to avoid
+/// regenerating ICC bytes and MD5 sums.
 #[derive(Default)]
 struct IccStore {
     order: VecDeque<u64>,
     map: HashMap<u64, Box<[u8]>>,
     simple: Vec<(JxlColorEncoding, u32, u64)>,
     bytes: usize,
+    retired: VecDeque<(Instant, Box<[u8]>)>,
+    retired_bytes: usize,
 }
 
 impl IccStore {
+    fn clear(&mut self) {
+        self.order.clear();
+        self.map.clear();
+        self.simple.clear();
+        self.retired.clear();
+        self.bytes = 0;
+        self.retired_bytes = 0;
+    }
+
+    fn reclaim_retired(&mut self, now: Instant) {
+        while let Some((retired_at, _)) = self.retired.front() {
+            if now.saturating_duration_since(*retired_at) >= ICC_RETIRE_GRACE
+                || self.retired_bytes > ICC_RETIRED_MAX_BYTES
+            {
+                if let Some((_, old_box)) = self.retired.pop_front() {
+                    self.retired_bytes = self.retired_bytes.saturating_sub(old_box.len());
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn touch_key(&mut self, key: u64) {
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key);
+        }
+    }
+
     fn retain_with_key(&mut self, profile: &[u8]) -> Option<(*const u8, usize, u64)> {
-        if profile.is_empty() {
+        let now = Instant::now();
+        self.reclaim_retired(now);
+        if profile.is_empty() || profile.len() > ICC_MAX_BYTES {
             return None;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -513,28 +604,42 @@ impl IccStore {
         let mut key = hasher.finish();
         if let Some(existing) = self.map.get(&key) {
             if existing.as_ref() == profile {
-                return Some((existing.as_ptr(), existing.len(), key));
+                let ptr = existing.as_ptr();
+                let len = existing.len();
+                self.touch_key(key);
+                return Some((ptr, len, key));
             }
-            for (&existing_key, existing_val) in &self.map {
-                if existing_val.as_ref() == profile {
-                    return Some((existing_val.as_ptr(), existing_val.len(), existing_key));
-                }
+            let found = self
+                .map
+                .iter()
+                .find(|(_, v)| v.as_ref() == profile)
+                .map(|(&k, v)| (v.as_ptr(), v.len(), k));
+            if let Some((ptr, len, existing_key)) = found {
+                self.touch_key(existing_key);
+                return Some((ptr, len, existing_key));
             }
             while self.map.contains_key(&key) {
                 key = key.wrapping_add(1);
             }
         }
         while let Some(old) = (self.map.len() >= ICC_MAX_PROFILES
-            || self.bytes + profile.len() > ICC_MAX_BYTES)
+            || self.bytes.saturating_add(profile.len()) > ICC_MAX_BYTES)
             .then(|| self.order.pop_front())
             .flatten()
         {
             if let Some(old_box) = self.map.remove(&old) {
-                self.bytes -= old_box.len();
+                let old_len = old_box.len();
+                self.bytes -= old_len;
+                self.retired_bytes = self.retired_bytes.saturating_add(old_len);
+                self.retired.push_back((now, old_box));
+                self.reclaim_retired(now);
             }
             self.simple.retain(|&(_, _, k)| k != old);
         }
-        let owned: Box<[u8]> = profile.into();
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(profile.len()).ok()?;
+        buf.extend_from_slice(profile);
+        let owned: Box<[u8]> = buf.into_boxed_slice();
         let ptr = owned.as_ptr();
         let len = owned.len();
         self.bytes += len;
@@ -553,6 +658,7 @@ impl IccStore {
                 self.retain_with_key(bytes).map(|(ptr, len, _)| (ptr, len))
             }
             JxlColorProfile::Simple(enc) => {
+                self.reclaim_retired(Instant::now());
                 let target_bits = intensity_target.to_bits();
                 if let Some(&(_, _, key)) = self
                     .simple
@@ -560,12 +666,15 @@ impl IccStore {
                     .find(|(e, t, _)| e == enc && *t == target_bits)
                 {
                     if let Some(existing) = self.map.get(&key) {
-                        return Some((existing.as_ptr(), existing.len()));
+                        let ptr = existing.as_ptr();
+                        let len = existing.len();
+                        self.touch_key(key);
+                        return Some((ptr, len));
                     }
                 }
-                #[cfg(jxl_try_as_icc_target)]
+                #[cfg(feature = "upstream-jxl-icc-target")]
                 let icc = profile.try_as_icc(intensity_target)?;
-                #[cfg(not(jxl_try_as_icc_target))]
+                #[cfg(not(feature = "upstream-jxl-icc-target"))]
                 let icc = {
                     let _ = intensity_target;
                     profile.try_as_icc()?
@@ -657,6 +766,18 @@ impl DecodeRunner {
 
     fn was_canceled(&self) -> bool {
         self.shared.canceled.load(Ordering::Acquire)
+    }
+
+    fn run_serial(&self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> Result<(), JxlError> {
+        let cancel = self.shared.cancel_token as *mut c_void;
+        for i in 0..num {
+            if canceled(cancel) {
+                self.shared.canceled.store(true, Ordering::Release);
+                return Err(JxlError::IOError(std::io::Error::other("canceled")));
+            }
+            fun(i)?;
+        }
+        Ok(())
     }
 }
 
@@ -761,16 +882,12 @@ impl JxlParallelRunner for DecodeRunner {
             return Err(JxlError::IOError(std::io::Error::other("canceled")));
         }
 
-        let total_workers = max_threads.unwrap_or(usize::MAX).min(self.max_threads).min(num);
+        let total_workers = max_threads
+            .unwrap_or(usize::MAX)
+            .min(self.max_threads)
+            .min(num);
         if total_workers <= 1 {
-            for i in 0..num {
-                if canceled(cancel) {
-                    self.shared.canceled.store(true, Ordering::Release);
-                    return Err(JxlError::IOError(std::io::Error::other("canceled")));
-                }
-                fun(i)?;
-            }
-            return Ok(());
+            return self.run_serial(num, fun);
         }
 
         let mut helpers = total_workers - 1;
@@ -794,14 +911,7 @@ impl JxlParallelRunner for DecodeRunner {
         }
 
         if helpers == 0 {
-            for i in 0..num {
-                if canceled(cancel) {
-                    self.shared.canceled.store(true, Ordering::Release);
-                    return Err(JxlError::IOError(std::io::Error::other("canceled")));
-                }
-                fun(i)?;
-            }
-            return Ok(());
+            return self.run_serial(num, fun);
         }
 
         self.shared.next_task.store(0, Ordering::Release);
@@ -863,12 +973,11 @@ impl Drop for DecodeRunner {
     }
 }
 
-/// 64-byte base-aligned, zero-initialized pixel buffer (`alloc_zeroed`).
+/// 64-byte aligned, OS demand-zero pixel buffer (`alloc_zeroed`).
 ///
-/// Uses a single heap allocation whose byte length is stored directly in
-/// `IGPixelBuffer::release_context`, avoiding a secondary `Box<Vec<u8>>`
-/// allocation. Because the ABI requires tight packing (`stride = width * 4`),
-/// only row 0 is guaranteed 64-byte aligned.
+/// Avoids a synchronous single-threaded `memset` over multi-GB frames, lets
+/// worker threads fault pages in parallel during rendering, and eliminates the
+/// secondary `Box<Vec<u8>>` allocation for `IGPixelBuffer::release_context`.
 struct AlignedBuffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -895,24 +1004,54 @@ impl AlignedBuffer {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
-    fn as_output_buffer(&mut self, height: usize, bytes_per_row: usize) -> JxlOutputBuffer<'_> {
-        unsafe {
-            JxlOutputBuffer::new_from_ptr(self.ptr.as_ptr(), height, bytes_per_row, bytes_per_row)
+    fn as_output_buffer(
+        &mut self,
+        height: usize,
+        bytes_per_row: usize,
+    ) -> Result<JxlOutputBuffer<'_>, IGStatus> {
+        if height == 0
+            || bytes_per_row == 0
+            || height
+                .checked_mul(bytes_per_row)
+                .is_none_or(|n| n > self.len)
+        {
+            return Err(DECODE_FAILED);
         }
+        // SAFETY: `height * bytes_per_row <= self.len` is verified above and
+        // `&mut self` grants exclusive mutable access for the returned lifetime.
+        Ok(unsafe {
+            JxlOutputBuffer::new_from_ptr(self.ptr.as_ptr(), height, bytes_per_row, bytes_per_row)
+        })
     }
 
-    fn into_pixel_buffer(self, width: usize, height: usize) -> IGPixelBuffer {
+    fn into_pixel_buffer(self, width: usize, height: usize) -> Result<IGPixelBuffer, IGStatus> {
+        if width == 0 || height == 0 {
+            return Err(DECODE_FAILED);
+        }
+        let w = i32::try_from(width).map_err(|_| DECODE_FAILED)?;
+        let h = i32::try_from(height).map_err(|_| DECODE_FAILED)?;
+        let stride = width
+            .checked_mul(4)
+            .and_then(|s| i32::try_from(s).ok())
+            .ok_or(DECODE_FAILED)?;
+        let needed = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(DECODE_FAILED)?;
+        if needed > self.len {
+            return Err(DECODE_FAILED);
+        }
         let data = self.ptr.as_ptr();
         let release_context = self.len as *mut c_void;
         std::mem::forget(self);
-        IGPixelBuffer {
+        Ok(IGPixelBuffer {
             data,
-            width: width as i32,
-            height: height as i32,
-            stride: (width * 4) as i32,
+            width: w,
+            height: h,
+            stride,
             pixel_format: PIXEL_BGRA8,
             release_context,
-        }
+        })
     }
 }
 
@@ -940,6 +1079,7 @@ impl PooledDecoder {
         let decoder = reused.unwrap_or_else(|| {
             let mut options = JxlDecoderOptions::default();
             options.sample_limit = Some(JXL_SAMPLE_LIMIT);
+            options.alpha_mode = AlphaMode::Unpremultiplied;
             JxlDecoder::new(options)
         });
         Self {
@@ -1012,11 +1152,16 @@ fn canceled(token: *mut c_void) -> bool {
 
 impl PluginState {
     fn new() -> Self {
-        let mut strings: Vec<Vec<u16>> =
-            ["Plugin_JxlCodec", "JPEG XL", "2.0.0", "codec_jxl", ".jxl"]
-                .iter()
-                .map(|s| s.encode_utf16().collect())
-                .collect();
+        let mut strings: Vec<Vec<u16>> = [
+            "Plugin_JxlCodec",
+            "JPEG XL",
+            env!("CARGO_PKG_VERSION"),
+            "codec_jxl",
+            ".jxl",
+        ]
+        .iter()
+        .map(|s| s.encode_utf16().collect())
+        .collect();
         let refs: Vec<_> = strings
             .iter()
             .map(|s| IGStringRef {
@@ -1072,7 +1217,7 @@ impl PluginState {
             },
             get_codec,
             initialize: None,
-            shutdown: Some(plugin_shutdown),
+            shutdown: Some(shutdown),
             self_test: None,
         });
         // Keep UTF-16 buffers alive for as long as the ABI tables are reachable.
@@ -1089,6 +1234,27 @@ impl PluginState {
     }
 }
 
+unsafe extern "C" fn shutdown() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        if let Ok(mut pool) = state.decoders.lock() {
+            pool.clear();
+            pool.shrink_to_fit();
+        }
+        if let Ok(mut icc) = state.icc.lock() {
+            icc.clear();
+        }
+    }));
+}
+
+/// Returns the plugin's ABI function table for a compatible ImageGlass host.
+///
+/// # Safety
+/// When non-null, `host_api` must point to a valid, initialized `IGHostApi`
+/// whose `core` field (when non-null) points to a valid `IGHostCoreApi` struct
+/// that remains live while plugin calls execute.
 #[no_mangle]
 pub unsafe extern "C" fn ig_plugin_get_api(
     host_abi_version: i32,
@@ -1108,21 +1274,6 @@ pub unsafe extern "C" fn ig_plugin_get_api(
         Ok(state) => unsafe { &*(*state).plugin },
         Err(_) => std::ptr::null(),
     }
-}
-
-unsafe extern "C" fn plugin_shutdown() {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if let Some(state) = STATE.get() {
-            if let Ok(mut pool) = state.decoders.lock() {
-                pool.clear();
-                pool.shrink_to_fit();
-            }
-            if let Ok(mut icc) = state.icc.lock() {
-                *icc = IccStore::default();
-            }
-        }
-        HOST_CORE.store(std::ptr::null_mut(), Ordering::Release);
-    }));
 }
 
 unsafe extern "C" fn get_codec(index: i32, out: *mut *mut IGCodecApi) -> i32 {
@@ -1192,12 +1343,34 @@ fn validate_basic_info(basic: &JxlBasicInfo) -> Result<(usize, usize, bool, usiz
         || width
             .checked_mul(height)
             .is_none_or(|n| n > MAX_IMAGE_PIXELS)
-        || width > i32::MAX as usize
+        || width
+            .checked_mul(4)
+            .and_then(|s| i32::try_from(s).ok())
+            .is_none()
         || height > i32::MAX as usize
     {
+        log_host(
+            LOG_ERROR,
+            &format!("jxl_codec: unsupported or overflowing image dimensions {width}x{height}"),
+        );
         return Err(DECODE_FAILED);
     }
     if basic.animation.is_some() {
+        log_host(
+            LOG_WARN,
+            "jxl_codec: animated JXL images are not supported by static raster codec",
+        );
+        return Err(UNSUPPORTED);
+    }
+    if basic
+        .extra_channels
+        .iter()
+        .any(|c| matches!(c.ec_type, ExtraChannel::Black))
+    {
+        log_host(
+            LOG_WARN,
+            "jxl_codec: CMYK JXL images with Black extra channel are not supported",
+        );
         return Err(UNSUPPORTED);
     }
     let alpha = basic
@@ -1207,19 +1380,41 @@ fn validate_basic_info(basic: &JxlBasicInfo) -> Result<(usize, usize, bool, usiz
     Ok((width, height, alpha, basic.extra_channels.len()))
 }
 
+fn is_cmyk_decoder(decoder: &JxlDecoder) -> bool {
+    decoder
+        .output_color_profile()
+        .is_some_and(|profile| profile.is_cmyk())
+}
+
 fn map_jxl_err(err: JxlError, input: &FileInput, cancel: *mut c_void) -> IGStatus {
     if input.reader.was_canceled || canceled(cancel) {
         return CANCELED;
     }
-    if input.reader.io_err || matches!(err, JxlError::IOError(_)) {
-        return IO_ERROR;
-    }
     if matches!(
-        err,
+        &err,
         JxlError::OutOfMemory(_) | JxlError::ImageOutOfMemory(_, _)
     ) {
+        log_host(
+            LOG_ERROR,
+            &format!("jxl_codec: decoder out of memory: {err}"),
+        );
         return OUT_OF_MEMORY;
     }
+    if matches!(
+        &err,
+        JxlError::IOError(io_err) if io_err.kind() == std::io::ErrorKind::OutOfMemory
+    ) {
+        log_host(
+            LOG_ERROR,
+            &format!("jxl_codec: read buffer out of memory: {err}"),
+        );
+        return OUT_OF_MEMORY;
+    }
+    if input.reader.io_err || matches!(&err, JxlError::IOError(_)) {
+        log_host(LOG_ERROR, &format!("jxl_codec: stream I/O error: {err}"));
+        return IO_ERROR;
+    }
+    log_host(LOG_ERROR, &format!("jxl_codec: decode failed: {err}"));
     DECODE_FAILED
 }
 
@@ -1236,6 +1431,10 @@ fn read_until_basic_info(
             Ok(Event::BasicInfo) => return Ok(()),
             Ok(Event::NeedMoreInput { .. }) => {
                 if input.is_exhausted() {
+                    log_host(
+                        LOG_ERROR,
+                        "jxl_codec: unexpected EOF while parsing JXL header",
+                    );
                     return Err(DECODE_FAILED);
                 }
             }
@@ -1244,6 +1443,21 @@ fn read_until_basic_info(
             Err(err) => return Err(map_jxl_err(err, input, cancel)),
         }
     }
+}
+
+fn frame_fits_available_memory(
+    bytes: usize,
+    extra_margin_bytes: usize,
+    avail_bytes: usize,
+) -> bool {
+    // A 32000x32000 frame alone is ~4 GB, and jxl-rs, compressed sections, plus
+    // the host's own copy need more on top. Refuse into OutOfMemory rather than
+    // paging the host.
+    let required = bytes
+        .saturating_add(bytes / 2)
+        .saturating_add(extra_margin_bytes)
+        .saturating_add(64 * 1024 * 1024);
+    required <= avail_bytes
 }
 
 fn allocate_checked_frame(
@@ -1255,37 +1469,62 @@ fn allocate_checked_frame(
         .checked_mul(height)
         .and_then(|n| n.checked_mul(4))
         .filter(|&n| n <= MAX_OUTPUT_BYTES && n <= isize::MAX as usize)
-        .ok_or(DECODE_FAILED)?;
-    // A 32000x32000 frame alone is ~4 GB, and jxl-rs plus the host's own copy
-    // need more on top. Refuse into OutOfMemory rather than paging the host.
-    let required = bytes
-        .saturating_add(bytes / 2)
-        .saturating_add(extra_margin_bytes)
-        .saturating_add(64 * 1024 * 1024);
-    if required > available_physical_bytes() {
+        .ok_or_else(|| {
+            log_host(
+                LOG_ERROR,
+                &format!("jxl_codec: output frame size overflow for {width}x{height}"),
+            );
+            DECODE_FAILED
+        })?;
+    let avail = available_physical_bytes();
+    if !frame_fits_available_memory(bytes, extra_margin_bytes, avail) {
+        log_host(
+            LOG_ERROR,
+            &format!(
+                "jxl_codec: insufficient physical memory for {width}x{height} ({bytes} bytes + {extra_margin_bytes} margin, available {avail} bytes)"
+            ),
+        );
         return Err(OUT_OF_MEMORY);
     }
-    AlignedBuffer::alloc_zeroed(bytes).ok_or(OUT_OF_MEMORY)
+    AlignedBuffer::alloc_zeroed(bytes).ok_or_else(|| {
+        log_host(
+            LOG_ERROR,
+            &format!(
+                "jxl_codec: pixel buffer allocation failed for {width}x{height} ({bytes} bytes)"
+            ),
+        );
+        OUT_OF_MEMORY
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FrameSpec {
+    width: usize,
+    height: usize,
+    extra_channels: usize,
 }
 
 fn decode_full_frame(
     decoder: &mut JxlDecoder,
     input: &mut FileInput,
     pixels: &mut AlignedBuffer,
-    width: usize,
-    height: usize,
-    extra_channels: usize,
+    spec: FrameSpec,
     runner: &mut DecodeRunner,
     cancel: *mut c_void,
 ) -> Result<(), IGStatus> {
     input.set_decode_mode();
     if decoder
-        .set_pixel_format(bgra8_pixel_format(extra_channels))
+        .set_pixel_format(bgra8_pixel_format(spec.extra_channels))
         .is_err()
     {
+        log_host(
+            LOG_ERROR,
+            "jxl_codec: failed to configure BGRA8 pixel format",
+        );
         return Err(DECODE_FAILED);
     }
-    let mut out_buf = [pixels.as_output_buffer(height, width * 4)];
+    let bytes_per_row = spec.width.checked_mul(4).ok_or(DECODE_FAILED)?;
+    let mut out_buf = [pixels.as_output_buffer(spec.height, bytes_per_row)?];
     let mut frame_complete = false;
     loop {
         if canceled(cancel) {
@@ -1300,10 +1539,20 @@ fn decode_full_frame(
             Ok(Event::Complete) => break,
             Ok(Event::NeedMoreInput { .. }) => {
                 if input.is_exhausted() {
+                    log_host(
+                        LOG_ERROR,
+                        "jxl_codec: unexpected EOF while decoding JXL frame",
+                    );
                     return Err(DECODE_FAILED);
                 }
             }
-            Ok(Event::BasicInfo) => return Err(DECODE_FAILED),
+            Ok(Event::BasicInfo) => {
+                log_host(
+                    LOG_ERROR,
+                    "jxl_codec: unexpected duplicate BasicInfo event during frame decode",
+                );
+                return Err(DECODE_FAILED);
+            }
             Err(err) => {
                 if runner.was_canceled() {
                     return Err(CANCELED);
@@ -1318,6 +1567,7 @@ fn decode_full_frame(
     if frame_complete {
         Ok(())
     } else {
+        log_host(LOG_ERROR, "jxl_codec: JXL stream completed without a frame");
         Err(DECODE_FAILED)
     }
 }
@@ -1354,244 +1604,126 @@ impl SendMutPtr {
     }
 }
 
-fn gcd_usize(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a.max(1)
+struct ImagePlane<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
 }
 
-#[derive(Clone, Copy)]
-struct XSpan {
-    sx0: usize,
-    sx1: usize,
-    w_left: u64,
-    w_right: u64,
+struct ImagePlaneMut<'a> {
+    data: &'a mut [u8],
+    width: usize,
+    height: usize,
 }
 
 fn downscale_bgra8(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    dst: &mut [u8],
-    dst_w: usize,
-    dst_h: usize,
+    src: ImagePlane<'_>,
+    dst: ImagePlaneMut<'_>,
     has_alpha: bool,
     runner: &mut DecodeRunner,
     cancel: *mut c_void,
 ) -> Result<(), IGStatus> {
-    let gx = gcd_usize(src_w, dst_w);
-    let sw = src_w / gx;
-    let dw = dst_w / gx;
-    let dw_u64 = dw as u64;
-    let sw_u64 = sw as u64;
-
-    let gy = gcd_usize(src_h, dst_h);
-    let sh = src_h / gy;
-    let dh = dst_h / gy;
-    let dh_u64 = dh as u64;
-    let sh_u64 = sh as u64;
-
-    let total_weight = sw_u64 * sh_u64;
-    let half_weight = total_weight / 2;
-
-    let mut x_spans = Vec::with_capacity(dst_w);
-    let sw_128 = sw as u128;
-    let dw_128 = dw as u128;
-    for dx in 0..dst_w {
-        let x_start = (dx as u128) * sw_128;
-        let x_end = ((dx + 1) as u128) * sw_128;
-        let sx0 = (x_start / dw_128) as usize;
-        let sx1 = x_end.div_ceil(dw_128) as usize;
-        if sx0 + 1 == sx1 {
-            x_spans.push(XSpan {
-                sx0,
-                sx1,
-                w_left: sw_u64,
-                w_right: 0,
-            });
-        } else {
-            let w_left = (dw_128 - (x_start % dw_128)) as u64;
-            let w_right = (x_end - ((sx1 - 1) as u128) * dw_128) as u64;
-            x_spans.push(XSpan {
-                sx0,
-                sx1,
-                w_left,
-                w_right,
-            });
-        }
+    let src_w = src.width;
+    let src_h = src.height;
+    let dst_w = dst.width;
+    let dst_h = dst.height;
+    let Some(src_stride) = src_w.checked_mul(4) else {
+        return Err(DECODE_FAILED);
+    };
+    let Some(dst_stride) = dst_w.checked_mul(4) else {
+        return Err(DECODE_FAILED);
+    };
+    let Some(src_needed) = src_stride.checked_mul(src_h) else {
+        return Err(DECODE_FAILED);
+    };
+    let Some(dst_needed) = dst_stride.checked_mul(dst_h) else {
+        return Err(DECODE_FAILED);
+    };
+    if src_w == 0
+        || src_h == 0
+        || dst_w == 0
+        || dst_h == 0
+        || src.data.len() < src_needed
+        || dst.data.len() < dst_needed
+    {
+        return Err(DECODE_FAILED);
     }
-
-    let src_stride = src_w * 4;
-    let dst_stride = dst_w * 4;
-    let dst_base = SendMutPtr(dst.as_mut_ptr());
-    let max_threads = dst_h.div_ceil(8).max(1);
-    let sh_128 = sh as u128;
-    let dh_128 = dh as u128;
-    let cancel_token = cancel as usize;
-
+    let mut x_spans = Vec::new();
+    x_spans
+        .try_reserve_exact(dst_w)
+        .map_err(|_| OUT_OF_MEMORY)?;
+    for dx in 0..dst_w {
+        let x0 = ((dx as u128 * src_w as u128) / dst_w as u128) as usize;
+        let x1 = ((((dx + 1) as u128 * src_w as u128) / dst_w as u128) as usize)
+            .max(x0 + 1)
+            .min(src_w);
+        x_spans.push((x0, x1));
+    }
+    let src_data = src.data;
+    let dst_base = SendMutPtr(dst.data.as_mut_ptr());
+    let max_threads = dst_h.div_ceil(16).max(1);
     let res = runner.run_ordered(dst_h, Some(max_threads), &|dy| {
-        let y_start = (dy as u128) * sh_128;
-        let y_end = ((dy + 1) as u128) * sh_128;
-        let sy0 = (y_start / dh_128) as usize;
-        let sy1 = y_end.div_ceil(dh_128) as usize;
-        let single_row = sy0 + 1 == sy1;
-        let wy_first = if single_row {
-            sh_u64
-        } else {
-            (dh_128 - (y_start % dh_128)) as u64
-        };
-        let wy_last = if single_row {
-            0
-        } else {
-            (y_end - ((sy1 - 1) as u128) * dh_128) as u64
-        };
-
-        // SAFETY: each `dy` writes strictly to its own disjoint row `dy * dst_stride`.
+        let y0 = ((dy as u128 * src_h as u128) / dst_h as u128) as usize;
+        let y1 = ((((dy + 1) as u128 * src_h as u128) / dst_h as u128) as usize)
+            .max(y0 + 1)
+            .min(src_h);
+        // SAFETY: `dst.data.len() >= dst_stride * dst_h` is verified above, and each
+        // `dy` writes strictly to its own disjoint row `dy * dst_stride`.
         let dst_row =
             unsafe { std::slice::from_raw_parts_mut(dst_base.add(dy * dst_stride), dst_stride) };
         if !has_alpha {
-            let mut acc = vec![[0u64; 3]; dst_w];
-            let mut polled_pixels = 0usize;
-            for sy in sy0..sy1 {
-                polled_pixels += src_w;
-                if polled_pixels >= CANCEL_POLL_BYTES {
-                    polled_pixels = 0;
-                    if canceled(cancel_token as *mut c_void) {
-                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
+            for (dx, &(x0, x1)) in x_spans.iter().enumerate() {
+                let mut sum_b = 0u64;
+                let mut sum_g = 0u64;
+                let mut sum_r = 0u64;
+                for sy in y0..y1 {
+                    let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
+                    for sx in x0..x1 {
+                        let off = sx * 4;
+                        sum_b += row[off] as u64;
+                        sum_g += row[off + 1] as u64;
+                        sum_r += row[off + 2] as u64;
                     }
                 }
-                let wy = if sy == sy0 {
-                    wy_first
-                } else if sy + 1 == sy1 {
-                    wy_last
-                } else {
-                    dh_u64
-                };
-                let row = &src[sy * src_stride..(sy + 1) * src_stride];
-                for (dst_px, span) in acc.iter_mut().zip(x_spans.iter()) {
-                    let p0 = span.sx0 * 4;
-                    let (rb, rg, rr) = if span.sx0 + 1 == span.sx1 {
-                        (
-                            (row[p0] as u64) * span.w_left,
-                            (row[p0 + 1] as u64) * span.w_left,
-                            (row[p0 + 2] as u64) * span.w_left,
-                        )
-                    } else {
-                        let mut mid_b = 0u64;
-                        let mut mid_g = 0u64;
-                        let mut mid_r = 0u64;
-                        let mid = &row[(span.sx0 + 1) * 4..(span.sx1 - 1) * 4];
-                        for px in mid.chunks_exact(4) {
-                            mid_b += px[0] as u64;
-                            mid_g += px[1] as u64;
-                            mid_r += px[2] as u64;
-                        }
-                        let pr = (span.sx1 - 1) * 4;
-                        (
-                            (row[p0] as u64) * span.w_left
-                                + mid_b * dw_u64
-                                + (row[pr] as u64) * span.w_right,
-                            (row[p0 + 1] as u64) * span.w_left
-                                + mid_g * dw_u64
-                                + (row[pr + 1] as u64) * span.w_right,
-                            (row[p0 + 2] as u64) * span.w_left
-                                + mid_r * dw_u64
-                                + (row[pr + 2] as u64) * span.w_right,
-                        )
-                    };
-                    dst_px[0] += rb * wy;
-                    dst_px[1] += rg * wy;
-                    dst_px[2] += rr * wy;
-                }
-            }
-            for (dst_px, out) in acc.iter().zip(dst_row.chunks_exact_mut(4)) {
-                out[0] = ((dst_px[0] + half_weight) / total_weight) as u8;
-                out[1] = ((dst_px[1] + half_weight) / total_weight) as u8;
-                out[2] = ((dst_px[2] + half_weight) / total_weight) as u8;
-                out[3] = 255;
+                let count = ((x1 - x0) as u64) * ((y1 - y0) as u64);
+                let half = count / 2;
+                let out = dx * 4;
+                dst_row[out] = ((sum_b + half) / count) as u8;
+                dst_row[out + 1] = ((sum_g + half) / count) as u8;
+                dst_row[out + 2] = ((sum_r + half) / count) as u8;
+                dst_row[out + 3] = 255;
             }
         } else {
-            let mut acc = vec![[0u64; 4]; dst_w];
-            let mut polled_pixels = 0usize;
-            for sy in sy0..sy1 {
-                polled_pixels += src_w;
-                if polled_pixels >= CANCEL_POLL_BYTES {
-                    polled_pixels = 0;
-                    if canceled(cancel_token as *mut c_void) {
-                        return Err(JxlError::IOError(std::io::Error::other("canceled")));
+            for (dx, &(x0, x1)) in x_spans.iter().enumerate() {
+                let mut sum_ba = 0u64;
+                let mut sum_ga = 0u64;
+                let mut sum_ra = 0u64;
+                let mut sum_a = 0u64;
+                for sy in y0..y1 {
+                    let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
+                    for sx in x0..x1 {
+                        let off = sx * 4;
+                        let a = row[off + 3] as u64;
+                        sum_ba += (row[off] as u64) * a;
+                        sum_ga += (row[off + 1] as u64) * a;
+                        sum_ra += (row[off + 2] as u64) * a;
+                        sum_a += a;
                     }
                 }
-                let wy = if sy == sy0 {
-                    wy_first
-                } else if sy + 1 == sy1 {
-                    wy_last
-                } else {
-                    dh_u64
-                };
-                let row = &src[sy * src_stride..(sy + 1) * src_stride];
-                for (dst_px, span) in acc.iter_mut().zip(x_spans.iter()) {
-                    let p0 = span.sx0 * 4;
-                    let a0 = row[p0 + 3] as u64;
-                    let (rba, rga, rra, ra) = if span.sx0 + 1 == span.sx1 {
-                        let wa = span.w_left * a0;
-                        (
-                            (row[p0] as u64) * wa,
-                            (row[p0 + 1] as u64) * wa,
-                            (row[p0 + 2] as u64) * wa,
-                            wa,
-                        )
-                    } else {
-                        let mut mid_ba = 0u64;
-                        let mut mid_ga = 0u64;
-                        let mut mid_ra = 0u64;
-                        let mut mid_a = 0u64;
-                        let mid = &row[(span.sx0 + 1) * 4..(span.sx1 - 1) * 4];
-                        for px in mid.chunks_exact(4) {
-                            let a = px[3] as u64;
-                            mid_ba += (px[0] as u64) * a;
-                            mid_ga += (px[1] as u64) * a;
-                            mid_ra += (px[2] as u64) * a;
-                            mid_a += a;
-                        }
-                        let wa0 = span.w_left * a0;
-                        let pr = (span.sx1 - 1) * 4;
-                        let war = span.w_right * (row[pr + 3] as u64);
-                        (
-                            (row[p0] as u64) * wa0
-                                + mid_ba * dw_u64
-                                + (row[pr] as u64) * war,
-                            (row[p0 + 1] as u64) * wa0
-                                + mid_ga * dw_u64
-                                + (row[pr + 1] as u64) * war,
-                            (row[p0 + 2] as u64) * wa0
-                                + mid_ra * dw_u64
-                                + (row[pr + 2] as u64) * war,
-                            wa0 + mid_a * dw_u64 + war,
-                        )
-                    };
-                    dst_px[0] += rba * wy;
-                    dst_px[1] += rga * wy;
-                    dst_px[2] += rra * wy;
-                    dst_px[3] += ra * wy;
-                }
-            }
-            for (dst_px, out) in acc.iter().zip(dst_row.chunks_exact_mut(4)) {
-                let sum_a = dst_px[3];
-                let out_a = ((sum_a + half_weight) / total_weight).min(255) as u8;
+                let count = ((x1 - x0) as u64) * ((y1 - y0) as u64);
+                let out = dx * 4;
+                let out_a = ((sum_a + count / 2) / count) as u8;
                 if sum_a > 0 {
                     let half_a = sum_a / 2;
-                    out[0] = ((dst_px[0] + half_a) / sum_a).min(255) as u8;
-                    out[1] = ((dst_px[1] + half_a) / sum_a).min(255) as u8;
-                    out[2] = ((dst_px[2] + half_a) / sum_a).min(255) as u8;
+                    dst_row[out] = ((sum_ba + half_a) / sum_a).min(255) as u8;
+                    dst_row[out + 1] = ((sum_ga + half_a) / sum_a).min(255) as u8;
+                    dst_row[out + 2] = ((sum_ra + half_a) / sum_a).min(255) as u8;
                 } else {
-                    out[0] = 0;
-                    out[1] = 0;
-                    out[2] = 0;
+                    dst_row[out] = 0;
+                    dst_row[out + 1] = 0;
+                    dst_row[out + 2] = 0;
                 }
-                out[3] = out_a;
+                dst_row[out + 3] = out_a;
             }
         }
         Ok(())
@@ -1599,7 +1731,10 @@ fn downscale_bgra8(
     match res {
         Ok(()) => Ok(()),
         Err(_) if runner.was_canceled() || canceled(cancel) => Err(CANCELED),
-        Err(_) => Err(DECODE_FAILED),
+        Err(_) => {
+            log_host(LOG_ERROR, "jxl_codec: parallel thumbnail downscale failed");
+            Err(DECODE_FAILED)
+        }
     }
 }
 
@@ -1609,19 +1744,30 @@ unsafe extern "C" fn load_metadata(
     cancel: *mut c_void,
 ) -> i32 {
     boundary(|| {
+        if !out.is_null() {
+            unsafe {
+                *out = IGImageInfo::default();
+            }
+        }
         if path.data.is_null() || path.length < 0 || out.is_null() {
             return INVALID_ARG;
         }
         if canceled(cancel) {
             return CANCELED;
         }
-        let path = match string_path(path) {
+        let path = match unsafe { string_path(path) } {
             Ok(p) => p,
             Err(s) => return s,
         };
         let mut input = match FileInput::open(&path, METADATA_READ_BUF, cancel) {
             Ok(f) => f,
-            Err(_) => return IO_ERROR,
+            Err(e) => {
+                log_host(
+                    LOG_ERROR,
+                    &format!("jxl_codec: failed to open {}: {e}", path.display()),
+                );
+                return IO_ERROR;
+            }
         };
         let file_size = i64::try_from(input.length).unwrap_or(-1);
 
@@ -1631,6 +1777,10 @@ unsafe extern "C" fn load_metadata(
         }
 
         let Some(basic) = decoder.basic_info() else {
+            log_host(
+                LOG_ERROR,
+                "jxl_codec: missing basic info after header parse",
+            );
             return DECODE_FAILED;
         };
         let intensity_target = basic.tone_mapping.intensity_target;
@@ -1644,6 +1794,10 @@ unsafe extern "C" fn load_metadata(
             .set_pixel_format(bgra8_pixel_format(extra_channels))
             .is_err()
         {
+            log_host(
+                LOG_ERROR,
+                "jxl_codec: failed to configure BGRA8 pixel format",
+            );
             return DECODE_FAILED;
         }
 
@@ -1652,6 +1806,13 @@ unsafe extern "C" fn load_metadata(
         // and the host must not rotate again — always report Identity.
         let (icc_ptr, icc_len) = match decoder.output_color_profile() {
             Some(profile) => {
+                if profile.is_cmyk() {
+                    log_host(
+                        LOG_WARN,
+                        "jxl_codec: CMYK JXL color profiles are not supported",
+                    );
+                    return UNSUPPORTED;
+                }
                 let Ok(mut store) = STATE.get().expect("plugin initialized").icc.lock() else {
                     return INTERNAL;
                 };
@@ -1681,6 +1842,74 @@ unsafe extern "C" fn load_metadata(
     }) as i32
 }
 
+struct OpenedDecode {
+    input: FileInput,
+    decoder: PooledDecoder,
+    width: usize,
+    height: usize,
+    alpha: bool,
+    extra_channels: usize,
+    preview_oriented: Option<(usize, usize)>,
+}
+
+/// # Safety
+/// `path` must satisfy the preconditions of `string_path`.
+unsafe fn open_decode_session(
+    path: IGStringRef,
+    cancel: *mut c_void,
+) -> Result<OpenedDecode, IGStatus> {
+    let path = unsafe { string_path(path)? };
+    let mut input = FileInput::open(&path, METADATA_READ_BUF, cancel).map_err(|e| {
+        log_host(
+            LOG_ERROR,
+            &format!("jxl_codec: failed to open {}: {e}", path.display()),
+        );
+        IO_ERROR
+    })?;
+    let mut decoder = PooledDecoder::checkout();
+    read_until_basic_info(&mut decoder, &mut input, cancel)?;
+
+    let Some(basic) = decoder.basic_info() else {
+        log_host(
+            LOG_ERROR,
+            "jxl_codec: missing basic info after header parse",
+        );
+        return Err(DECODE_FAILED);
+    };
+    let (width, height, alpha, extra_channels) = validate_basic_info(basic)?;
+    let preview_oriented = basic
+        .preview_size
+        .map(|ps| basic.orientation.map_size(ps))
+        .filter(|&(pw, ph)| pw > 0 && ph > 0);
+    if decoder
+        .set_pixel_format(bgra8_pixel_format(extra_channels))
+        .is_err()
+    {
+        log_host(
+            LOG_ERROR,
+            "jxl_codec: failed to configure BGRA8 pixel format",
+        );
+        return Err(DECODE_FAILED);
+    }
+    if is_cmyk_decoder(&decoder) {
+        log_host(
+            LOG_WARN,
+            "jxl_codec: CMYK JXL color profiles are not supported",
+        );
+        return Err(UNSUPPORTED);
+    }
+    decoder.set_recycle(width.saturating_mul(height) <= DECODER_POOL_MAX_PIXELS);
+    Ok(OpenedDecode {
+        input,
+        decoder,
+        width,
+        height,
+        alpha,
+        extra_channels,
+        preview_oriented,
+    })
+}
+
 unsafe extern "C" fn decode_static_raster(
     path: IGStringRef,
     frame: i32,
@@ -1688,61 +1917,183 @@ unsafe extern "C" fn decode_static_raster(
     cancel: *mut c_void,
 ) -> i32 {
     boundary(|| {
+        if !out.is_null() {
+            unsafe {
+                *out = IGPixelBuffer::default();
+            }
+        }
         if path.data.is_null() || path.length < 0 || out.is_null() || frame != 0 {
             return INVALID_ARG;
-        }
-        unsafe {
-            *out = IGPixelBuffer::default();
         }
         if canceled(cancel) {
             return CANCELED;
         }
-        let path = match string_path(path) {
-            Ok(p) => p,
-            Err(s) => return s,
-        };
-        let mut input = match FileInput::open(&path, METADATA_READ_BUF, cancel) {
-            Ok(f) => f,
-            Err(_) => return IO_ERROR,
-        };
-        let mut decoder = PooledDecoder::checkout();
-        if let Err(status) = read_until_basic_info(&mut decoder, &mut input, cancel) {
-            return status;
-        }
-
-        let Some(basic) = decoder.basic_info() else {
-            return DECODE_FAILED;
-        };
-        let (width, height, _, extra_channels) = match validate_basic_info(basic) {
-            Ok(info) => info,
+        let mut session = match unsafe { open_decode_session(path, cancel) } {
+            Ok(s) => s,
             Err(status) => return status,
         };
-        decoder.set_recycle(width.saturating_mul(height) <= DECODER_POOL_MAX_PIXELS);
-
-        let mut pixels = match allocate_checked_frame(width, height, 0) {
+        let mut pixels = match allocate_checked_frame(
+            session.width,
+            session.height,
+            session.input.compressed_margin(),
+        ) {
             Ok(b) => b,
             Err(status) => return status,
         };
 
         let mut runner = DecodeRunner::new(cancel);
         if let Err(status) = decode_full_frame(
-            &mut decoder,
-            &mut input,
+            &mut session.decoder,
+            &mut session.input,
             &mut pixels,
-            width,
-            height,
-            extra_channels,
+            FrameSpec {
+                width: session.width,
+                height: session.height,
+                extra_channels: session.extra_channels,
+            },
             &mut runner,
             cancel,
         ) {
             return status;
         }
 
+        let buf = match pixels.into_pixel_buffer(session.width, session.height) {
+            Ok(b) => b,
+            Err(status) => return status,
+        };
         unsafe {
-            *out = pixels.into_pixel_buffer(width, height);
+            *out = buf;
         }
         OK
     }) as i32
+}
+
+struct PreviewTarget {
+    pw: usize,
+    ph: usize,
+    dst_w: usize,
+    dst_h: usize,
+    max_w: usize,
+    max_h: usize,
+    alpha: bool,
+    extra_channels: usize,
+}
+
+fn is_terminal_preview_err(status: IGStatus) -> bool {
+    matches!(status, CANCELED | OUT_OF_MEMORY | IO_ERROR | UNSUPPORTED)
+}
+
+fn try_decode_preview(
+    input: &mut FileInput,
+    target: PreviewTarget,
+    cancel: *mut c_void,
+) -> Result<Option<IGPixelBuffer>, IGStatus> {
+    if let Err(e) = input.rewind_to_start() {
+        log_host(
+            LOG_ERROR,
+            &format!("jxl_codec: failed to rewind stream for preview: {e}"),
+        );
+        return Err(IO_ERROR);
+    }
+    let mut preview_opts = JxlDecoderOptions::default();
+    preview_opts.sample_limit = Some(JXL_SAMPLE_LIMIT);
+    preview_opts.alpha_mode = AlphaMode::Unpremultiplied;
+    preview_opts.skip_preview = false;
+    let mut preview_dec = JxlDecoder::new(preview_opts);
+    if let Err(status) = read_until_basic_info(&mut preview_dec, input, cancel) {
+        return if is_terminal_preview_err(status) {
+            Err(status)
+        } else {
+            Ok(None)
+        };
+    }
+    let mut prev_buf = match allocate_checked_frame(target.pw, target.ph, input.compressed_margin())
+    {
+        Ok(buf) => buf,
+        Err(status) => {
+            return if is_terminal_preview_err(status) {
+                Err(status)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let mut runner = DecodeRunner::new(cancel);
+    if let Err(status) = decode_full_frame(
+        &mut preview_dec,
+        input,
+        &mut prev_buf,
+        FrameSpec {
+            width: target.pw,
+            height: target.ph,
+            extra_channels: target.extra_channels,
+        },
+        &mut runner,
+        cancel,
+    ) {
+        return if is_terminal_preview_err(status) {
+            Err(status)
+        } else {
+            Ok(None)
+        };
+    }
+
+    let same_aspect = target.pw <= target.max_w
+        && target.ph <= target.max_h
+        && (target.pw * target.dst_h).abs_diff(target.ph * target.dst_w)
+            <= target.pw.max(target.ph);
+    if same_aspect {
+        return match prev_buf.into_pixel_buffer(target.pw, target.ph) {
+            Ok(buf) => Ok(Some(buf)),
+            Err(status) if is_terminal_preview_err(status) => Err(status),
+            Err(_) => Ok(None),
+        };
+    }
+
+    let Some(thumb_bytes) = target
+        .dst_w
+        .checked_mul(target.dst_h)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n <= MAX_OUTPUT_BYTES && n <= isize::MAX as usize)
+    else {
+        return Ok(None);
+    };
+    let Some(mut thumb) = AlignedBuffer::alloc_zeroed(thumb_bytes) else {
+        log_host(
+            LOG_ERROR,
+            &format!(
+                "jxl_codec: preview thumbnail buffer allocation failed ({}x{})",
+                target.dst_w, target.dst_h
+            ),
+        );
+        return Err(OUT_OF_MEMORY);
+    };
+    if let Err(status) = downscale_bgra8(
+        ImagePlane {
+            data: prev_buf.as_slice(),
+            width: target.pw,
+            height: target.ph,
+        },
+        ImagePlaneMut {
+            data: thumb.as_mut_slice(),
+            width: target.dst_w,
+            height: target.dst_h,
+        },
+        target.alpha,
+        &mut runner,
+        cancel,
+    ) {
+        return if is_terminal_preview_err(status) {
+            Err(status)
+        } else {
+            Ok(None)
+        };
+    }
+    match thumb.into_pixel_buffer(target.dst_w, target.dst_h) {
+        Ok(buf) => Ok(Some(buf)),
+        Err(status) if is_terminal_preview_err(status) => Err(status),
+        Err(_) => Ok(None),
+    }
 }
 
 unsafe extern "C" fn decode_static_raster_scaled(
@@ -1771,31 +2122,18 @@ unsafe extern "C" fn decode_static_raster_scaled(
         if canceled(cancel) {
             return CANCELED;
         }
-        let path = match string_path(path) {
-            Ok(p) => p,
-            Err(s) => return s,
-        };
-        let mut input = match FileInput::open(&path, METADATA_READ_BUF, cancel) {
-            Ok(f) => f,
-            Err(_) => return IO_ERROR,
-        };
-        let mut decoder = PooledDecoder::checkout();
-        if let Err(status) = read_until_basic_info(&mut decoder, &mut input, cancel) {
-            return status;
-        }
-
-        let Some(basic) = decoder.basic_info() else {
-            return DECODE_FAILED;
-        };
-        let (width, height, alpha, extra_channels) = match validate_basic_info(basic) {
-            Ok(info) => info,
+        let OpenedDecode {
+            mut input,
+            mut decoder,
+            width,
+            height,
+            alpha,
+            extra_channels,
+            preview_oriented,
+        } = match unsafe { open_decode_session(path, cancel) } {
+            Ok(s) => s,
             Err(status) => return status,
         };
-        let preview_oriented = basic
-            .preview_size
-            .map(|ps| basic.orientation.map_size(ps))
-            .filter(|&(pw, ph)| pw > 0 && ph > 0);
-        decoder.set_recycle(width.saturating_mul(height) <= DECODER_POOL_MAX_PIXELS);
 
         let max_w = max_width as usize;
         let max_h = max_height as usize;
@@ -1803,7 +2141,8 @@ unsafe extern "C" fn decode_static_raster_scaled(
 
         // Unscaled fast path: source already fits inside max_width x max_height.
         if dst_w == width && dst_h == height {
-            let mut pixels = match allocate_checked_frame(width, height, 0) {
+            let mut pixels = match allocate_checked_frame(width, height, input.compressed_margin())
+            {
                 Ok(b) => b,
                 Err(status) => return status,
             };
@@ -1812,16 +2151,22 @@ unsafe extern "C" fn decode_static_raster_scaled(
                 &mut decoder,
                 &mut input,
                 &mut pixels,
-                width,
-                height,
-                extra_channels,
+                FrameSpec {
+                    width,
+                    height,
+                    extra_channels,
+                },
                 &mut runner,
                 cancel,
             ) {
                 return status;
             }
+            let buf = match pixels.into_pixel_buffer(width, height) {
+                Ok(b) => b,
+                Err(status) => return status,
+            };
             unsafe {
-                *out = pixels.into_pixel_buffer(width, height);
+                *out = buf;
             }
             return OK;
         }
@@ -1830,67 +2175,45 @@ unsafe extern "C" fn decode_static_raster_scaled(
         // the requested box and is smaller than the full-resolution image.
         if let Some((pw, ph)) = preview_oriented {
             if pw >= dst_w && ph >= dst_h && pw.saturating_mul(ph) < width.saturating_mul(height) {
-                if input.rewind_to_start().is_ok() {
-                    let mut preview_opts = JxlDecoderOptions::default();
-                    preview_opts.sample_limit = Some(JXL_SAMPLE_LIMIT);
-                    preview_opts.skip_preview = false;
-                    let mut preview_dec = JxlDecoder::new(preview_opts);
-                    if read_until_basic_info(&mut preview_dec, &mut input, cancel).is_ok() {
-                        if let Ok(mut prev_buf) = allocate_checked_frame(pw, ph, 0) {
-                            let mut runner = DecodeRunner::new(cancel);
-                            if decode_full_frame(
-                                &mut preview_dec,
-                                &mut input,
-                                &mut prev_buf,
-                                pw,
-                                ph,
-                                extra_channels,
-                                &mut runner,
-                                cancel,
-                            )
-                            .is_ok()
-                            {
-                                let same_aspect =
-                                    pw <= max_w && ph <= max_h && (pw * dst_h).abs_diff(ph * dst_w) <= pw.max(ph);
-                                if same_aspect {
-                                    unsafe {
-                                        *out = prev_buf.into_pixel_buffer(pw, ph);
-                                    }
-                                    return OK;
-                                }
-                                let thumb_bytes = dst_w.saturating_mul(dst_h).saturating_mul(4);
-                                if let Some(mut thumb) = AlignedBuffer::alloc_zeroed(thumb_bytes) {
-                                    if downscale_bgra8(
-                                        prev_buf.as_slice(),
-                                        pw,
-                                        ph,
-                                        thumb.as_mut_slice(),
-                                        dst_w,
-                                        dst_h,
-                                        alpha,
-                                        &mut runner,
-                                        cancel,
-                                    )
-                                    .is_ok()
-                                    {
-                                        unsafe {
-                                            *out = thumb.into_pixel_buffer(dst_w, dst_h);
-                                        }
-                                        return OK;
-                                    }
-                                }
-                            }
+                match try_decode_preview(
+                    &mut input,
+                    PreviewTarget {
+                        pw,
+                        ph,
+                        dst_w,
+                        dst_h,
+                        max_w,
+                        max_h,
+                        alpha,
+                        extra_channels,
+                    },
+                    cancel,
+                ) {
+                    Ok(Some(buf)) => {
+                        unsafe {
+                            *out = buf;
+                        }
+                        return OK;
+                    }
+                    Err(status) => return status,
+                    Ok(None) => {
+                        // Rewind for normal full-image decode if recoverable preview fallback occurred.
+                        if let Err(e) = input.rewind_to_start() {
+                            log_host(
+                                LOG_ERROR,
+                                &format!("jxl_codec: rewind after preview fallback failed: {e}"),
+                            );
+                            return IO_ERROR;
+                        }
+                        drop(decoder);
+                        decoder = PooledDecoder::checkout();
+                        decoder
+                            .set_recycle(width.saturating_mul(height) <= DECODER_POOL_MAX_PIXELS);
+                        if let Err(status) = read_until_basic_info(&mut decoder, &mut input, cancel)
+                        {
+                            return status;
                         }
                     }
-                }
-                // Rewind for normal full-image decode if preview fallback occurred.
-                if input.rewind_to_start().is_err() {
-                    return IO_ERROR;
-                }
-                decoder = PooledDecoder::checkout();
-                decoder.set_recycle(width.saturating_mul(height) <= DECODER_POOL_MAX_PIXELS);
-                if let Err(status) = read_until_basic_info(&mut decoder, &mut input, cancel) {
-                    return status;
                 }
             }
         }
@@ -1899,22 +2222,34 @@ unsafe extern "C" fn decode_static_raster_scaled(
             Some(n) if n <= MAX_OUTPUT_BYTES && n <= isize::MAX as usize => n,
             _ => return DECODE_FAILED,
         };
-        let mut full_pixels = match allocate_checked_frame(width, height, thumb_bytes) {
+        let mut full_pixels = match allocate_checked_frame(
+            width,
+            height,
+            thumb_bytes.saturating_add(input.compressed_margin()),
+        ) {
             Ok(b) => b,
             Err(status) => return status,
         };
         let Some(mut thumb_pixels) = AlignedBuffer::alloc_zeroed(thumb_bytes) else {
+            log_host(
+                LOG_ERROR,
+                &format!("jxl_codec: thumbnail buffer allocation failed ({dst_w}x{dst_h})"),
+            );
             return OUT_OF_MEMORY;
         };
 
         let mut runner = DecodeRunner::new(cancel);
+        // Decode to frame completion before downscaling; `flush_pixels() == Ok(true)`
+        // only indicates partial dirty-region updates rather than whole-frame coverage.
         if let Err(status) = decode_full_frame(
             &mut decoder,
             &mut input,
             &mut full_pixels,
-            width,
-            height,
-            extra_channels,
+            FrameSpec {
+                width,
+                height,
+                extra_channels,
+            },
             &mut runner,
             cancel,
         ) {
@@ -1922,12 +2257,16 @@ unsafe extern "C" fn decode_static_raster_scaled(
         }
 
         if let Err(status) = downscale_bgra8(
-            full_pixels.as_slice(),
-            width,
-            height,
-            thumb_pixels.as_mut_slice(),
-            dst_w,
-            dst_h,
+            ImagePlane {
+                data: full_pixels.as_slice(),
+                width,
+                height,
+            },
+            ImagePlaneMut {
+                data: thumb_pixels.as_mut_slice(),
+                width: dst_w,
+                height: dst_h,
+            },
             alpha,
             &mut runner,
             cancel,
@@ -1935,12 +2274,13 @@ unsafe extern "C" fn decode_static_raster_scaled(
             return status;
         }
         drop(full_pixels);
-        if canceled(cancel) {
-            return CANCELED;
-        }
 
+        let buf = match thumb_pixels.into_pixel_buffer(dst_w, dst_h) {
+            Ok(b) => b,
+            Err(status) => return status,
+        };
         unsafe {
-            *out = thumb_pixels.into_pixel_buffer(dst_w, dst_h);
+            *out = buf;
         }
         OK
     }) as i32
@@ -1962,25 +2302,651 @@ unsafe extern "C" fn free_pixel_buffer(buf: *mut IGPixelBuffer) {
     }));
 }
 
+/// # Safety
+/// `s.data` must be either null or valid for reads of `s.length` UTF-16 code
+/// units when `s.length >= 0`.
 #[cfg(target_os = "windows")]
-fn string_path(s: IGStringRef) -> Result<std::path::PathBuf, IGStatus> {
+unsafe fn string_path(s: IGStringRef) -> Result<std::path::PathBuf, IGStatus> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
+    if s.data.is_null() || s.length < 0 {
+        return Err(INVALID_ARG);
+    }
     let units = unsafe { std::slice::from_raw_parts(s.data, s.length as usize) };
     Ok(std::path::PathBuf::from(OsString::from_wide(units)))
 }
 
+/// # Safety
+/// `s.data` must be either null or valid for reads of `s.length` UTF-16 code
+/// units when `s.length >= 0`.
 #[cfg(not(target_os = "windows"))]
-fn string_path(s: IGStringRef) -> Result<std::path::PathBuf, IGStatus> {
+unsafe fn string_path(s: IGStringRef) -> Result<std::path::PathBuf, IGStatus> {
+    if s.data.is_null() || s.length < 0 {
+        return Err(INVALID_ARG);
+    }
     let units = unsafe { std::slice::from_raw_parts(s.data, s.length as usize) };
     String::from_utf16(units)
         .map(std::path::PathBuf::from)
         .map_err(|_| INVALID_ARG)
 }
 
+fn log_host(level: i32, msg: &str) {
+    let core = HOST_CORE.load(Ordering::Acquire);
+    if core.is_null() {
+        return;
+    }
+    let log_fn = unsafe { (*core).log };
+    if let Some(f) = log_fn {
+        let wide: Vec<u16> = msg.encode_utf16().collect();
+        let s = IGStringRef {
+            data: wide.as_ptr(),
+            length: wide.len().min(i32::MAX as usize) as i32,
+        };
+        unsafe { f(level, s) };
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn boundary(f: impl FnOnce() -> IGStatus) -> IGStatus {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(status) => status,
-        Err(_) => INTERNAL,
+        Err(payload) => {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let msg = panic_payload_message(payload);
+                log_host(
+                    LOG_ERROR,
+                    &format!("jxl_codec: panic caught at FFI boundary: {msg}"),
+                );
+            }));
+            INTERNAL
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jxl::api::{JxlAnimation, JxlBitDepth, JxlExtraChannel, Orientation, ToneMapping};
+    use std::sync::atomic::AtomicI32;
+
+    static HOST_CORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct HostCoreGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        prev: *mut IGHostCoreApi,
+    }
+
+    impl<'a> HostCoreGuard<'a> {
+        fn install(core: *mut IGHostCoreApi) -> Self {
+            let lock = HOST_CORE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = HOST_CORE.swap(core, Ordering::AcqRel);
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for HostCoreGuard<'_> {
+        fn drop(&mut self) {
+            HOST_CORE.store(self.prev, Ordering::Release);
+        }
+    }
+
+    fn make_basic_info(
+        width: usize,
+        height: usize,
+        extra_channels: Vec<JxlExtraChannel>,
+        animation: Option<JxlAnimation>,
+    ) -> JxlBasicInfo {
+        JxlBasicInfo {
+            size: (width, height),
+            bit_depth: JxlBitDepth::Int { bits_per_sample: 8 },
+            orientation: Orientation::Identity,
+            extra_channels,
+            animation,
+            uses_original_profile: true,
+            tone_mapping: ToneMapping {
+                intensity_target: 255.0,
+                min_nits: 0.0,
+                relative_to_max_display: false,
+                linear_below: 0.0,
+            },
+            preview_size: None,
+        }
+    }
+
+    #[test]
+    fn validate_basic_info_stride_and_limits() {
+        let max_w = (i32::MAX as usize) / 4;
+        assert_eq!(
+            validate_basic_info(&make_basic_info(max_w, 1, Vec::new(), None)),
+            Ok((max_w, 1, false, 0))
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(max_w + 1, 1, Vec::new(), None)),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(600_000_000, 1, Vec::new(), None)),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(0, 10, Vec::new(), None)),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(10, 0, Vec::new(), None)),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(32_000, 32_000, Vec::new(), None)),
+            Ok((32_000, 32_000, false, 0))
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(32_001, 32_000, Vec::new(), None)),
+            Err(DECODE_FAILED)
+        );
+        let anim = Some(JxlAnimation {
+            tps_numerator: 1,
+            tps_denominator: 1,
+            num_loops: 0,
+            have_timecodes: false,
+        });
+        assert_eq!(
+            validate_basic_info(&make_basic_info(16, 16, Vec::new(), anim)),
+            Err(UNSUPPORTED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(
+                16,
+                16,
+                vec![JxlExtraChannel {
+                    ec_type: ExtraChannel::Black,
+                    alpha_associated: false,
+                }],
+                None,
+            )),
+            Err(UNSUPPORTED)
+        );
+        assert_eq!(
+            validate_basic_info(&make_basic_info(
+                16,
+                16,
+                vec![JxlExtraChannel {
+                    ec_type: ExtraChannel::Alpha,
+                    alpha_associated: true,
+                }],
+                None,
+            )),
+            Ok((16, 16, true, 1))
+        );
+    }
+
+    #[test]
+    fn cmyk_profile_detection() {
+        let mut cmyk_icc = vec![0u8; 32];
+        cmyk_icc[16..20].copy_from_slice(b"CMYK");
+        assert!(JxlColorProfile::Icc(cmyk_icc).is_cmyk());
+
+        let mut rgb_icc = vec![0u8; 32];
+        rgb_icc[16..20].copy_from_slice(b"RGB ");
+        assert!(!JxlColorProfile::Icc(rgb_icc).is_cmyk());
+    }
+
+    #[test]
+    fn icc_store_enforces_size_and_count_caps_and_grace_window() {
+        let mut store = IccStore::default();
+        assert!(store.retain_with_key(&[]).is_none());
+
+        let exact = vec![0x42u8; ICC_MAX_BYTES];
+        let (ptr, len, _) = store.retain_with_key(&exact).expect("exact cap accepted");
+        assert_eq!(len, ICC_MAX_BYTES);
+        assert_eq!(store.bytes, ICC_MAX_BYTES);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(ptr, len) },
+            exact.as_slice()
+        );
+
+        let over = vec![0x99u8; ICC_MAX_BYTES + 1];
+        assert!(store.retain_with_key(&over).is_none());
+        assert_eq!(store.bytes, ICC_MAX_BYTES);
+        assert_eq!(store.map.len(), 1);
+
+        let mut empty_store = IccStore::default();
+        assert!(empty_store.retain_with_key(&over).is_none());
+        assert_eq!(empty_store.bytes, 0);
+        assert!(empty_store.map.is_empty());
+
+        let mut lru_store = IccStore::default();
+        let mut first_profile = vec![1u8; 64];
+        first_profile[0] = 0;
+        let (first_ptr, first_len, _) = lru_store
+            .retain_with_key(&first_profile)
+            .expect("first profile stored");
+        for i in 1..=(ICC_MAX_PROFILES + 4) {
+            let mut p = vec![2u8; 64];
+            p[..std::mem::size_of::<usize>()].copy_from_slice(&i.to_le_bytes());
+            assert!(lru_store.retain_with_key(&p).is_some());
+        }
+        assert!(lru_store.map.len() <= ICC_MAX_PROFILES);
+        assert!(!lru_store.retired.is_empty());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(first_ptr, first_len) },
+            first_profile.as_slice()
+        );
+
+        lru_store.clear();
+        assert!(lru_store.map.is_empty());
+        assert!(lru_store.retired.is_empty());
+        assert_eq!(lru_store.bytes, 0);
+        assert_eq!(lru_store.retired_bytes, 0);
+    }
+
+    #[test]
+    fn icc_store_concurrent_eviction_keeps_pointer_readable() {
+        let store = Arc::new(Mutex::new(IccStore::default()));
+        let profile_a = vec![0xA5u8; 1024];
+        let (ptr, len, _) = store
+            .lock()
+            .unwrap()
+            .retain_with_key(&profile_a)
+            .expect("profile A stored");
+        let ptr_addr = ptr as usize;
+
+        let mut writers = Vec::new();
+        for tid in 0..4usize {
+            let store = Arc::clone(&store);
+            writers.push(thread::spawn(move || {
+                for i in 0..30usize {
+                    let mut buf = vec![(tid as u8).wrapping_add(1); 1024];
+                    buf[..std::mem::size_of::<usize>()]
+                        .copy_from_slice(&(tid * 100 + i).to_le_bytes());
+                    let _ = store.lock().unwrap().retain_with_key(&buf);
+                    let seen = unsafe { std::slice::from_raw_parts(ptr_addr as *const u8, len) };
+                    assert!(seen.iter().all(|&b| b == 0xA5));
+                }
+            }));
+        }
+        for w in writers {
+            w.join().expect("writer thread panicked");
+        }
+        let guard = store.lock().unwrap();
+        assert!(guard.map.len() <= ICC_MAX_PROFILES);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(ptr_addr as *const u8, len) },
+            profile_a.as_slice()
+        );
+    }
+
+    #[test]
+    fn map_jxl_err_classifies_oom_io_cancel_and_decode() {
+        let manifest = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let mut input =
+            FileInput::open(manifest, 0, std::ptr::null_mut()).expect("open Cargo.toml");
+
+        let oom_io = JxlError::IOError(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "read buffer",
+        ));
+        assert_eq!(
+            map_jxl_err(oom_io, &input, std::ptr::null_mut()),
+            OUT_OF_MEMORY
+        );
+
+        let not_found =
+            JxlError::IOError(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        assert_eq!(
+            map_jxl_err(not_found, &input, std::ptr::null_mut()),
+            IO_ERROR
+        );
+
+        assert_eq!(
+            map_jxl_err(
+                JxlError::ImageOutOfMemory(1024, 1024),
+                &input,
+                std::ptr::null_mut()
+            ),
+            OUT_OF_MEMORY
+        );
+        assert_eq!(
+            map_jxl_err(JxlError::InvalidSignature, &input, std::ptr::null_mut()),
+            DECODE_FAILED
+        );
+
+        input.reader.was_canceled = true;
+        assert_eq!(
+            map_jxl_err(JxlError::InvalidSignature, &input, std::ptr::null_mut()),
+            CANCELED
+        );
+    }
+
+    #[test]
+    fn preview_terminal_error_classification() {
+        assert!(is_terminal_preview_err(CANCELED));
+        assert!(is_terminal_preview_err(OUT_OF_MEMORY));
+        assert!(is_terminal_preview_err(IO_ERROR));
+        assert!(is_terminal_preview_err(UNSUPPORTED));
+        assert!(!is_terminal_preview_err(DECODE_FAILED));
+    }
+
+    #[test]
+    fn memory_admission_respects_available_and_compressed_margin() {
+        let frame_bytes = 128 * 1024 * 1024;
+        assert!(!frame_fits_available_memory(
+            frame_bytes,
+            0,
+            200 * 1024 * 1024
+        ));
+        assert!(frame_fits_available_memory(
+            frame_bytes,
+            0,
+            512 * 1024 * 1024
+        ));
+        assert!(!frame_fits_available_memory(
+            frame_bytes,
+            300 * 1024 * 1024,
+            512 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn downscale_bgra8_box_averaging_and_alpha() {
+        let mut runner = DecodeRunner::new(std::ptr::null_mut());
+        let mut src = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let off = (y * 16 + x) * 4;
+                let v = if x % 2 == 0 { 0u8 } else { 255u8 };
+                src[off] = v;
+                src[off + 1] = v;
+                src[off + 2] = v;
+                src[off + 3] = 255;
+            }
+        }
+        let mut dst_1x1 = [0u8; 4];
+        downscale_bgra8(
+            ImagePlane {
+                data: &src,
+                width: 16,
+                height: 16,
+            },
+            ImagePlaneMut {
+                data: &mut dst_1x1,
+                width: 1,
+                height: 1,
+            },
+            false,
+            &mut runner,
+            std::ptr::null_mut(),
+        )
+        .expect("16x16 -> 1x1 succeeds");
+        assert_eq!(dst_1x1, [128, 128, 128, 255]);
+
+        let mut dst_4x4 = vec![0u8; 4 * 4 * 4];
+        downscale_bgra8(
+            ImagePlane {
+                data: &src,
+                width: 16,
+                height: 16,
+            },
+            ImagePlaneMut {
+                data: &mut dst_4x4,
+                width: 4,
+                height: 4,
+            },
+            false,
+            &mut runner,
+            std::ptr::null_mut(),
+        )
+        .expect("16x16 -> 4x4 succeeds");
+        for px in dst_4x4.as_chunks::<4>().0 {
+            assert_eq!(px, &[128, 128, 128, 255]);
+        }
+
+        // Alpha-weighted averaging: opaque red + transparent black -> pure red at half alpha
+        let alpha_src = [0u8, 0, 255, 255, 0, 0, 0, 0];
+        let mut alpha_dst = [0u8; 4];
+        downscale_bgra8(
+            ImagePlane {
+                data: &alpha_src,
+                width: 2,
+                height: 1,
+            },
+            ImagePlaneMut {
+                data: &mut alpha_dst,
+                width: 1,
+                height: 1,
+            },
+            true,
+            &mut runner,
+            std::ptr::null_mut(),
+        )
+        .expect("alpha downscale succeeds");
+        assert_eq!(alpha_dst, [0, 0, 255, 128]);
+
+        let mut tiny_dst = [0u8; 3];
+        assert_eq!(
+            downscale_bgra8(
+                ImagePlane {
+                    data: &alpha_src,
+                    width: 2,
+                    height: 1,
+                },
+                ImagePlaneMut {
+                    data: &mut tiny_dst,
+                    width: 1,
+                    height: 1,
+                },
+                true,
+                &mut runner,
+                std::ptr::null_mut(),
+            ),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            downscale_bgra8(
+                ImagePlane {
+                    data: &alpha_src,
+                    width: 0,
+                    height: 1,
+                },
+                ImagePlaneMut {
+                    data: &mut alpha_dst,
+                    width: 1,
+                    height: 1,
+                },
+                false,
+                &mut runner,
+                std::ptr::null_mut(),
+            ),
+            Err(DECODE_FAILED)
+        );
+
+        assert_eq!(fit_within_box(100, 50, 200, 200), (100, 50));
+        assert_eq!(fit_within_box(400, 200, 100, 100), (100, 50));
+        assert_eq!(fit_within_box(200, 400, 100, 100), (50, 100));
+        assert_eq!(fit_within_box(1000, 1, 100, 100), (100, 1));
+    }
+
+    #[test]
+    fn aligned_buffer_bounds_checks() {
+        let mut buf = AlignedBuffer::alloc_zeroed(16).expect("16-byte alloc");
+        assert!(buf.as_output_buffer(0, 4).is_err());
+        assert!(buf.as_output_buffer(4, 0).is_err());
+        assert!(buf.as_output_buffer(5, 4).is_err());
+        assert!(buf.as_output_buffer(4, 4).is_ok());
+
+        let too_wide = AlignedBuffer::alloc_zeroed(16).expect("16-byte alloc");
+        assert!(too_wide.into_pixel_buffer(4, 2).is_err());
+
+        let zero_dim = AlignedBuffer::alloc_zeroed(16).expect("16-byte alloc");
+        assert!(zero_dim.into_pixel_buffer(0, 1).is_err());
+
+        let ok_buf = AlignedBuffer::alloc_zeroed(16).expect("16-byte alloc");
+        let mut raw = ok_buf.into_pixel_buffer(2, 2).expect("valid 2x2");
+        assert_eq!(raw.width, 2);
+        assert_eq!(raw.height, 2);
+        assert_eq!(raw.stride, 8);
+        unsafe { free_pixel_buffer(&mut raw) };
+        assert!(raw.data.is_null());
+    }
+
+    #[test]
+    fn decode_runner_parallel_serial_cancel_error_and_panic() {
+        // Serial and parallel execution each visit every task index exactly once.
+        for max_threads in [Some(1), Some(4)] {
+            let counts: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+            let mut runner = DecodeRunner::new(std::ptr::null_mut());
+            runner.max_threads = 4;
+            runner
+                .run_ordered(64, max_threads, &|i| {
+                    counts[i].fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .expect("tasks complete");
+            assert!(counts.iter().all(|c| c.load(Ordering::SeqCst) == 1));
+        }
+
+        // Mid-run cancellation stops execution and marks `was_canceled`.
+        {
+            static CANCEL: AtomicI32 = AtomicI32::new(0);
+            unsafe extern "C" fn poll_cancel(tok: *mut c_void) -> i32 {
+                unsafe { &*(tok as *const AtomicI32) }.load(Ordering::Acquire)
+            }
+            CANCEL.store(0, Ordering::Release);
+            let mut core = IGHostCoreApi {
+                log: None,
+                alloc: None,
+                free: None,
+                is_cancellation_requested: Some(poll_cancel),
+                get_config_directory: None,
+            };
+            let _guard = HostCoreGuard::install(&mut core);
+            let token = (&CANCEL as *const AtomicI32) as *mut c_void;
+            let mut runner = DecodeRunner::new(token);
+            runner.max_threads = 4;
+            let res = runner.run_ordered(64, Some(4), &|i| {
+                if i == 0 {
+                    CANCEL.store(1, Ordering::Release);
+                }
+                thread::sleep(Duration::from_millis(2));
+                Ok(())
+            });
+            assert!(res.is_err());
+            assert!(runner.was_canceled());
+        }
+
+        // Worker error propagates and stops remaining work.
+        let mut err_runner = DecodeRunner::new(std::ptr::null_mut());
+        err_runner.max_threads = 4;
+        let err_res = err_runner.run_ordered(32, Some(4), &|i| {
+            if i == 2 {
+                Err(JxlError::InvalidSignature)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(err_res, Err(JxlError::InvalidSignature)));
+
+        // Worker panic waits for all active helpers to exit before unwinding.
+        let active_helpers = AtomicUsize::new(0);
+        let panic_res = catch_unwind(AssertUnwindSafe(|| {
+            let mut panic_runner = DecodeRunner::new(std::ptr::null_mut());
+            panic_runner.max_threads = 4;
+            panic_runner.run_ordered(16, Some(4), &|i| {
+                struct ActiveGuard<'a>(&'a AtomicUsize);
+                impl Drop for ActiveGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                active_helpers.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveGuard(&active_helpers);
+                if i == 1 {
+                    panic!("intentional worker panic");
+                }
+                thread::sleep(Duration::from_millis(5));
+                Ok(())
+            })
+        }));
+        assert!(panic_res.is_err());
+        assert_eq!(active_helpers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn host_log_callback_and_shutdown_cleanup() {
+        static TEST_LOGS: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn capture_log(level: i32, msg: IGStringRef) {
+            if !msg.data.is_null() && msg.length > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(msg.data, msg.length as usize) };
+                TEST_LOGS
+                    .lock()
+                    .unwrap()
+                    .push((level, String::from_utf16_lossy(slice)));
+            }
+        }
+        let mut core = IGHostCoreApi {
+            log: Some(capture_log),
+            alloc: None,
+            free: None,
+            is_cancellation_requested: None,
+            get_config_directory: None,
+        };
+        let _guard = HostCoreGuard::install(&mut core);
+        TEST_LOGS.lock().unwrap().clear();
+
+        log_host(LOG_WARN, "diagnostic check");
+        let status = boundary(|| panic!("boundary panic test"));
+        assert_eq!(status, INTERNAL);
+        {
+            let logs = TEST_LOGS.lock().unwrap();
+            assert!(logs
+                .iter()
+                .any(|(lvl, msg)| *lvl == LOG_WARN && msg == "diagnostic check"));
+            assert!(logs
+                .iter()
+                .any(|(lvl, msg)| *lvl == LOG_ERROR && msg.contains("boundary panic test")));
+        }
+
+        let state = STATE.get_or_init(PluginState::new);
+        {
+            let mut pool = state.decoders.lock().unwrap();
+            pool.push(JxlDecoder::new(JxlDecoderOptions::default()));
+        }
+        {
+            let mut icc = state.icc.lock().unwrap();
+            assert!(icc.retain_with_key(&[1, 2, 3, 4]).is_some());
+        }
+        unsafe { shutdown() };
+        assert!(state.decoders.lock().unwrap().is_empty());
+        {
+            let icc = state.icc.lock().unwrap();
+            assert!(icc.map.is_empty());
+            assert!(icc.retired.is_empty());
+            assert_eq!(icc.bytes, 0);
+            assert_eq!(icc.retired_bytes, 0);
+        }
+        let dec = PooledDecoder::checkout();
+        drop(dec);
+        assert_eq!(state.decoders.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_matches_cargo_pkg_version() {
+        let manifest = include_str!("../igplugin.json");
+        let expected = format!("\"version\": \"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(
+            manifest.contains(&expected),
+            "igplugin.json missing expected version entry {expected}"
+        );
     }
 }

@@ -6,18 +6,69 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   # Branch the nightly is built from. Scheduled runs always use the default
   # branch's workflow file, so this must be selected explicitly below.
   NIGHTLY_BRANCH: nightly
 
-permissions:
-  contents: write
-
 jobs:
+  prepare:
+    name: Resolve nightly revisions
+    runs-on: ubuntu-latest
+    outputs:
+      plugin_sha: ${{ steps.plugin.outputs.sha }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NIGHTLY_BRANCH }}
+          persist-credentials: false
+
+      # A `schedule` event always runs the default branch's copy of this file
+      # with GITHUB_REF=refs/heads/<default>. If that happens, the explicit
+      # `ref:` above still lands us on NIGHTLY_BRANCH, but a manual dispatch
+      # could also be pointed at the wrong branch. Fail loudly either way
+      # instead of silently publishing a main build as "nightly".
+      - name: Verify we are building the nightly branch
+        id: plugin
+        shell: bash
+        run: |
+          # Compare full refs: the abbreviated forms are ambiguous when a tag
+          # shares the branch's name (`nightly` is also the pre-release tag).
+          actual=$(git symbolic-ref HEAD 2>/dev/null || echo "DETACHED")
+          expected="refs/heads/${NIGHTLY_BRANCH}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::Expected ${expected}, got '${actual}'."
+            exit 1
+          fi
+          sha=$(git rev-parse HEAD)
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${NIGHTLY_BRANCH} at ${sha}."
+
+      - name: Resolve latest upstream jxl-rs revision
+        id: upstream
+        shell: bash
+        run: |
+          SHA=$(git ls-remote https://github.com/libjxl/jxl-rs.git refs/heads/main | awk '{print $1}')
+          if [ -z "${SHA}" ]; then
+            echo "::error::Failed to resolve upstream libjxl/jxl-rs main SHA."
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved upstream libjxl/jxl-rs at ${SHA}."
+
   build:
     name: Build nightly (${{ matrix.os }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -33,37 +84,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.NIGHTLY_BRANCH }}
+          ref: ${{ needs.prepare.outputs.plugin_sha }}
+          persist-credentials: false
 
-      # A `schedule` event always runs the default branch's copy of this file
-      # with GITHUB_REF=refs/heads/<default>. If that happens, the explicit
-      # `ref:` above still lands us on NIGHTLY_BRANCH, but a manual dispatch
-      # could also be pointed at the wrong branch. Fail loudly either way
-      # instead of silently publishing a main build as "nightly".
-      - name: Verify we are building the nightly branch
+      - name: Point jxl dependency at resolved upstream SHA
         shell: bash
         run: |
-          # Compare full refs: the abbreviated forms are ambiguous when a tag
-          # shares the branch's name (`nightly` is also the pre-release tag).
-          actual=$(git symbolic-ref HEAD 2>/dev/null || echo "DETACHED")
-          expected="refs/heads/${NIGHTLY_BRANCH}"
-          if [ "${actual}" != "${expected}" ]; then
-            echo "::error::Expected ${expected}, got '${actual}'."
-            exit 1
-          fi
-          echo "Building ${NIGHTLY_BRANCH} at $(git rev-parse --short HEAD)."
-
-      - name: Resolve latest upstream jxl-rs revision
-        id: upstream
-        shell: bash
-        run: |
-          SHA=$(git ls-remote https://github.com/libjxl/jxl-rs.git refs/heads/main | awk '{print $1}')
-          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
-
-      - name: Point jxl dependency at latest upstream
-        shell: bash
-        run: |
-          sed "s|^jxl = .*|jxl = { git = \"https://github.com/libjxl/jxl-rs\", rev = \"${{ steps.upstream.outputs.sha }}\" }|" Cargo.toml > Cargo.toml.tmp
+          sed "s|^jxl = .*|jxl = { git = \"https://github.com/libjxl/jxl-rs\", rev = \"${{ needs.prepare.outputs.upstream_sha }}\" }|" Cargo.toml > Cargo.toml.tmp
           mv Cargo.toml.tmp Cargo.toml
           grep '^jxl' Cargo.toml
           cargo update -p jxl
@@ -71,11 +98,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build nightly (release)
-        run: cargo build --release
+      - name: Run nightly unit tests
+        run: cargo test --features upstream-jxl-icc-target
 
-      - name: Plugin smoke test (Windows)
-        if: runner.os == 'Windows'
+      - name: Build nightly (release)
+        run: cargo build --release --features upstream-jxl-icc-target
+
+      - name: Plugin smoke test
         run: cargo run --release --manifest-path tests/Cargo.toml
 
       - name: Upload platform artifact
@@ -87,21 +116,40 @@ jobs:
 
   release:
     name: Publish nightly pre-release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.NIGHTLY_BRANCH }}
+          ref: ${{ needs.prepare.outputs.plugin_sha }}
           fetch-depth: 0
 
       # Note: `nightly` is also the name of a pre-release tag. Push the fully
       # qualified ref so git never has to disambiguate branch from tag.
-      - name: Move nightly tag to this commit
+      - name: Move nightly tag monotonically to resolved commit
+        shell: bash
         run: |
-          git tag -f nightly
+          plugin_sha="${{ needs.prepare.outputs.plugin_sha }}"
+          if git rev-parse -q --verify refs/tags/nightly >/dev/null; then
+            current_tag_sha=$(git rev-parse refs/tags/nightly)
+            if [ "${plugin_sha}" != "${current_tag_sha}" ] && git merge-base --is-ancestor "${plugin_sha}" "${current_tag_sha}"; then
+              echo "::error::Refusing to move nightly tag backwards (${plugin_sha} is an ancestor of ${current_tag_sha})."
+              exit 1
+            fi
+          fi
+          git tag -f nightly "${plugin_sha}"
           git push -f origin refs/tags/nightly:refs/tags/nightly
+
+      - name: Generate platform manifests
+        shell: bash
+        run: |
+          jq '.executable = "libjxl_codec.so"' igplugin.json > igplugin.linux.json
+          jq '.executable = "libjxl_codec.dylib"' igplugin.json > igplugin.macos.json
+          jq -e '.executable == "libjxl_codec.so"' igplugin.linux.json >/dev/null
+          jq -e '.executable == "libjxl_codec.dylib"' igplugin.macos.json >/dev/null
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -115,9 +163,13 @@ jobs:
           tag_name: nightly
           name: Nightly
           body: |
-            Nightly build of the `nightly` branch against the latest upstream `libjxl/jxl-rs` (`main`).
+            Nightly build of the `nightly` branch (`${{ needs.prepare.outputs.plugin_sha }}`) against upstream `libjxl/jxl-rs` (`${{ needs.prepare.outputs.upstream_sha }}`).
             Pre-release — not intended for production use.
           prerelease: true
           files: |
             artifacts/*
             igplugin.json
+            igplugin.linux.json
+            igplugin.macos.json
+            LICENSE
+            THIRD_PARTY_NOTICES.txt

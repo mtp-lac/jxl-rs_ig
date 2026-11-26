@@ -10,6 +10,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -46,11 +51,13 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Run unit tests
+        run: cargo test --locked
+
       - name: Build (release)
         run: cargo build --release --locked
 
-      - name: Plugin smoke test (Windows)
-        if: runner.os == 'Windows'
+      - name: Plugin smoke test
         run: cargo run --release --manifest-path tests/Cargo.toml
 
       - name: Upload platform artifact
@@ -71,6 +78,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify release tag matches Cargo.toml and igplugin.json
+        shell: bash
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          cargo_ver=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          manifest_ver=$(jq -r '.version' igplugin.json)
+          if [ "${tag_ver}" != "${cargo_ver}" ] || [ "${tag_ver}" != "${manifest_ver}" ]; then
+            echo "::error::Version mismatch: tag=${GITHUB_REF_NAME}, Cargo.toml=${cargo_ver}, igplugin.json=${manifest_ver}"
+            exit 1
+          fi
+
+      - name: Generate platform manifests
+        shell: bash
+        run: |
+          jq '.executable = "libjxl_codec.so"' igplugin.json > igplugin.linux.json
+          jq '.executable = "libjxl_codec.dylib"' igplugin.json > igplugin.macos.json
+          jq -e '.executable == "libjxl_codec.so"' igplugin.linux.json >/dev/null
+          jq -e '.executable == "libjxl_codec.dylib"' igplugin.macos.json >/dev/null
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -83,4 +109,8 @@ jobs:
           files: |
             artifacts/*
             igplugin.json
+            igplugin.linux.json
+            igplugin.macos.json
+            LICENSE
+            THIRD_PARTY_NOTICES.txt
           generate_release_notes: true
