@@ -1,6 +1,6 @@
 [package]
 name = "jxl_codec"
-version = "4.0.0"
+version = "4.5.0"
 edition = "2021"
 authors = ["JXL Codec Developer"]
 description = "JPEG XL codec plugin for ImageGlass using jxl-rs"

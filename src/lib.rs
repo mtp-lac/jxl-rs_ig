@@ -744,7 +744,16 @@ struct GlobalPoolHandle {
     workers: Vec<JoinHandle<()>>,
 }
 
-static GLOBAL_POOL: Mutex<Option<GlobalPoolHandle>> = Mutex::new(None);
+struct PoolLifecycle {
+    shutting_down: bool,
+    handle: Option<GlobalPoolHandle>,
+}
+
+static GLOBAL_POOL: Mutex<PoolLifecycle> = Mutex::new(PoolLifecycle {
+    shutting_down: false,
+    handle: None,
+});
+static GLOBAL_POOL_DRAINED: Condvar = Condvar::new();
 
 fn acquire_global_pool(desired_helpers: usize) -> Option<Arc<GlobalPool>> {
     let cap = default_threads().saturating_sub(1);
@@ -752,8 +761,11 @@ fn acquire_global_pool(desired_helpers: usize) -> Option<Arc<GlobalPool>> {
         return None;
     }
     let target_workers = desired_helpers.min(cap);
-    let mut guard = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let handle = guard.get_or_insert_with(|| GlobalPoolHandle {
+    let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if lifecycle.shutting_down {
+        return None;
+    }
+    let handle = lifecycle.handle.get_or_insert_with(|| GlobalPoolHandle {
         pool: Arc::new(GlobalPool {
             state: Mutex::new(PoolQueueState {
                 shutdown: false,
@@ -779,11 +791,31 @@ fn acquire_global_pool(desired_helpers: usize) -> Option<Arc<GlobalPool>> {
     Some(Arc::clone(&handle.pool))
 }
 
+struct ShutdownDrainGuard;
+
+impl Drop for ShutdownDrainGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        lifecycle.shutting_down = false;
+        GLOBAL_POOL_DRAINED.notify_all();
+    }
+}
+
 fn shutdown_global_pool() {
-    let handle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let Some(mut handle) = handle else {
-        return;
+    let mut handle = {
+        let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        while lifecycle.shutting_down {
+            lifecycle = GLOBAL_POOL_DRAINED
+                .wait(lifecycle)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let Some(handle) = lifecycle.handle.take() else {
+            return;
+        };
+        lifecycle.shutting_down = true;
+        handle
     };
+    let _drain_guard = ShutdownDrainGuard;
     {
         let mut st = handle.pool.state.lock().unwrap_or_else(|e| e.into_inner());
         st.shutdown = true;
@@ -1096,22 +1128,7 @@ impl AlignedBuffer {
     }
 
     fn into_pixel_buffer(self, width: usize, height: usize) -> Result<IGPixelBuffer, IGStatus> {
-        if width == 0 || height == 0 {
-            return Err(DECODE_FAILED);
-        }
-        let w = i32::try_from(width).map_err(|_| DECODE_FAILED)?;
-        let h = i32::try_from(height).map_err(|_| DECODE_FAILED)?;
-        let stride = width
-            .checked_mul(4)
-            .and_then(|s| i32::try_from(s).ok())
-            .ok_or(DECODE_FAILED)?;
-        let needed = width
-            .checked_mul(height)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(DECODE_FAILED)?;
-        if needed > self.len || needed > MAX_HOST_BUFFER_BYTES {
-            return Err(DECODE_FAILED);
-        }
+        let (w, h, stride) = validate_pixel_buffer_layout(self.len, width, height)?;
         let data = self.ptr.as_ptr();
         let release_context = self.len as *mut c_void;
         std::mem::forget(self);
@@ -1124,6 +1141,30 @@ impl AlignedBuffer {
             release_context,
         })
     }
+}
+
+fn validate_pixel_buffer_layout(
+    buf_len: usize,
+    width: usize,
+    height: usize,
+) -> Result<(i32, i32, i32), IGStatus> {
+    if width == 0 || height == 0 {
+        return Err(DECODE_FAILED);
+    }
+    let w = i32::try_from(width).map_err(|_| DECODE_FAILED)?;
+    let h = i32::try_from(height).map_err(|_| DECODE_FAILED)?;
+    let stride = width
+        .checked_mul(4)
+        .and_then(|s| i32::try_from(s).ok())
+        .ok_or(DECODE_FAILED)?;
+    let needed = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(DECODE_FAILED)?;
+    if needed > MAX_HOST_BUFFER_BYTES || needed > buf_len {
+        return Err(DECODE_FAILED);
+    }
+    Ok((w, h, stride))
 }
 
 impl Drop for AlignedBuffer {
@@ -1686,6 +1727,8 @@ fn fit_within_box(src_w: usize, src_h: usize, max_w: usize, max_h: usize) -> (us
     }
 }
 
+const MAX_HOST_PIXELS: usize = MAX_HOST_BUFFER_BYTES / 4;
+
 /// Scales `(width, height)` down proportionally only when its uncompressed BGRA8
 /// size exceeds `MAX_HOST_BUFFER_BYTES` (`i32::MAX` bytes).
 fn fit_within_host_budget(width: usize, height: usize) -> (usize, usize) {
@@ -1694,26 +1737,33 @@ fn fit_within_host_budget(width: usize, height: usize) -> (usize, usize) {
     }
     if width
         .checked_mul(height)
-        .and_then(|n| n.checked_mul(4))
-        .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES)
+        .is_some_and(|p| p <= MAX_HOST_PIXELS)
     {
         return (width, height);
     }
-    let max_pixels = (MAX_HOST_BUFFER_BYTES / 4) as f64;
-    let scale = (max_pixels / ((width as f64) * (height as f64))).sqrt();
+    let scale = ((MAX_HOST_PIXELS as f64) / ((width as f64) * (height as f64))).sqrt();
     let mut fit_w = (((width as f64) * scale).floor() as usize).clamp(1, width);
     let mut fit_h = (((height as f64) * scale).floor() as usize).clamp(1, height);
-    while fit_w
+    if fit_w
         .checked_mul(fit_h)
-        .and_then(|n| n.checked_mul(4))
-        .is_none_or(|b| b > MAX_HOST_BUFFER_BYTES)
+        .is_none_or(|p| p > MAX_HOST_PIXELS)
     {
-        if fit_w >= fit_h && fit_w > 1 {
-            fit_w -= 1;
-        } else if fit_h > 1 {
-            fit_h -= 1;
+        if fit_w >= fit_h {
+            fit_w = (MAX_HOST_PIXELS / fit_h).clamp(1, width);
+            if fit_w
+                .checked_mul(fit_h)
+                .is_none_or(|p| p > MAX_HOST_PIXELS)
+            {
+                fit_h = (MAX_HOST_PIXELS / fit_w).clamp(1, height);
+            }
         } else {
-            break;
+            fit_h = (MAX_HOST_PIXELS / fit_w).clamp(1, height);
+            if fit_w
+                .checked_mul(fit_h)
+                .is_none_or(|p| p > MAX_HOST_PIXELS)
+            {
+                fit_w = (MAX_HOST_PIXELS / fit_h).clamp(1, width);
+            }
         }
     }
     (fit_w, fit_h)
@@ -1803,6 +1853,7 @@ struct ImagePlaneMut<'a> {
 }
 
 const TILE_DST_W: usize = 256;
+const DOWNSCALE_CANCEL_POLL_PIXELS: usize = 64 * 1024;
 
 fn downscale_row_opaque(
     src_data: &[u8],
@@ -1814,6 +1865,7 @@ fn downscale_row_opaque(
     cancel_token: usize,
 ) -> Result<(), JxlError> {
     let dy_count = (y1 - y0) as u64;
+    let mut pixels_since_poll: usize = 0;
     for (tile_idx, tile_spans) in x_spans.chunks(TILE_DST_W).enumerate() {
         let mut acc = [[0u64; 3]; TILE_DST_W];
         let tile_start = tile_idx * TILE_DST_W;
@@ -1826,10 +1878,23 @@ fn downscale_row_opaque(
                 let mut b = 0u64;
                 let mut g = 0u64;
                 let mut r = 0u64;
-                for px in row[x0 * 4..x1 * 4].as_chunks::<4>().0 {
-                    b += px[0] as u64;
-                    g += px[1] as u64;
-                    r += px[2] as u64;
+                for span_chunk in row[x0 * 4..x1 * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .chunks(DOWNSCALE_CANCEL_POLL_PIXELS)
+                {
+                    for px in span_chunk {
+                        b += px[0] as u64;
+                        g += px[1] as u64;
+                        r += px[2] as u64;
+                    }
+                    pixels_since_poll += span_chunk.len();
+                    if pixels_since_poll >= DOWNSCALE_CANCEL_POLL_PIXELS {
+                        pixels_since_poll = 0;
+                        if canceled(cancel_token as *mut c_void) {
+                            return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                        }
+                    }
                 }
                 acc[local_dx][0] += b;
                 acc[local_dx][1] += g;
@@ -1859,6 +1924,7 @@ fn downscale_row_alpha(
     cancel_token: usize,
 ) -> Result<(), JxlError> {
     let dy_count = (y1 - y0) as u64;
+    let mut pixels_since_poll: usize = 0;
     for (tile_idx, tile_spans) in x_spans.chunks(TILE_DST_W).enumerate() {
         let mut acc = [[0u64; 4]; TILE_DST_W];
         let tile_start = tile_idx * TILE_DST_W;
@@ -1872,12 +1938,25 @@ fn downscale_row_alpha(
                 let mut ga = 0u64;
                 let mut ra = 0u64;
                 let mut a_sum = 0u64;
-                for px in row[x0 * 4..x1 * 4].as_chunks::<4>().0 {
-                    let a = px[3] as u64;
-                    ba += (px[0] as u64) * a;
-                    ga += (px[1] as u64) * a;
-                    ra += (px[2] as u64) * a;
-                    a_sum += a;
+                for span_chunk in row[x0 * 4..x1 * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .chunks(DOWNSCALE_CANCEL_POLL_PIXELS)
+                {
+                    for px in span_chunk {
+                        let a = px[3] as u64;
+                        ba += (px[0] as u64) * a;
+                        ga += (px[1] as u64) * a;
+                        ra += (px[2] as u64) * a;
+                        a_sum += a;
+                    }
+                    pixels_since_poll += span_chunk.len();
+                    if pixels_since_poll >= DOWNSCALE_CANCEL_POLL_PIXELS {
+                        pixels_since_poll = 0;
+                        if canceled(cancel_token as *mut c_void) {
+                            return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                        }
+                    }
                 }
                 acc[local_dx][0] += ba;
                 acc[local_dx][1] += ga;
@@ -1990,7 +2069,13 @@ fn downscale_bgra8(
         }
     });
     match res {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if runner.was_canceled() || canceled(cancel) {
+                Err(CANCELED)
+            } else {
+                Ok(())
+            }
+        }
         Err(_) if runner.was_canceled() || canceled(cancel) => Err(CANCELED),
         Err(_) => {
             log_host(LOG_ERROR, "jxl_codec: parallel thumbnail downscale failed");
@@ -3291,7 +3376,7 @@ mod tests {
             .run_ordered(32, Some(4), &|_| Ok(()))
             .expect("warmup runner succeeds");
         unsafe { shutdown() };
-        assert!(GLOBAL_POOL.lock().unwrap().is_none());
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
         assert!(state.decoders.lock().unwrap().is_empty());
         {
             let icc = state.icc.lock().unwrap();
@@ -3403,6 +3488,23 @@ mod tests {
         assert_eq!(sq_w, sq_h);
         assert!(sq_w * sq_h * 4 <= MAX_HOST_BUFFER_BYTES);
 
+        // Extreme aspect ratios fit in O(1) without single-pixel decrement stalls.
+        for (w, h) in [
+            (1, 1_024_000_000),
+            (1_024_000_000, 1),
+            (MAX_HOST_PIXELS + 1, 1),
+            (2, 1_000_000_000),
+        ] {
+            let (ew, eh) = fit_within_host_budget(w, h);
+            assert!(ew >= 1 && eh >= 1 && ew <= w && eh <= h);
+            assert!(
+                ew.checked_mul(eh)
+                    .and_then(|n| n.checked_mul(4))
+                    .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES),
+                "extreme aspect {w}x{h} -> {ew}x{eh} exceeded budget"
+            );
+        }
+
         assert_eq!(choose_downsample_shift(16_000, 9_000, 140, 79), 3);
         assert_eq!(choose_downsample_shift(1_000, 1_000, 300, 300), 1);
         assert_eq!(choose_downsample_shift(1_000, 1_000, 600, 600), 0);
@@ -3411,8 +3513,17 @@ mod tests {
         assert_eq!(choose_host_budget_shift(32_000, 18_000), 1);
         assert_eq!(choose_host_budget_shift(32_000, 32_000), 1);
 
-        let small = AlignedBuffer::alloc_zeroed(16).expect("16-byte alloc");
-        assert_eq!(small.into_pixel_buffer(32_000, 18_000).err(), Some(DECODE_FAILED));
+        // Pure layout validation tests MAX_HOST_BUFFER_BYTES independently of backing allocation.
+        assert!(validate_pixel_buffer_layout(MAX_HOST_BUFFER_BYTES, MAX_HOST_PIXELS, 1).is_ok());
+        assert_eq!(
+            validate_pixel_buffer_layout(usize::MAX, MAX_HOST_PIXELS + 1, 1),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_pixel_buffer_layout(usize::MAX, 32_000, 18_000),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(validate_pixel_buffer_layout(16, 4, 2), Err(DECODE_FAILED));
     }
 
     fn reference_downscale_bgra8(
@@ -3562,6 +3673,50 @@ mod tests {
             token,
         );
         assert_eq!(status, Err(CANCELED));
+
+        // Wide single-row mid-span cancellation (y1 - y0 == 1 < 64) polls by pixel budget.
+        POLL_COUNT.store(0, Ordering::Release);
+        let wide_src = vec![0x55u8; (DOWNSCALE_CANCEL_POLL_PIXELS * 2) * 4];
+        let mut wide_dst = [0u8; 4];
+        let mut wide_runner = DecodeRunner::new(token);
+        let wide_status = downscale_bgra8(
+            ImagePlane {
+                data: &wide_src,
+                width: DOWNSCALE_CANCEL_POLL_PIXELS * 2,
+                height: 1,
+            },
+            ImagePlaneMut {
+                data: &mut wide_dst,
+                width: 1,
+                height: 1,
+            },
+            false,
+            &mut wide_runner,
+            token,
+        );
+        assert_eq!(wide_status, Err(CANCELED));
+
+        // Post-loop cancellation check catches cancellation arriving right at task completion.
+        POLL_COUNT.store(0, Ordering::Release);
+        let tiny_src = vec![0x33u8; 4 * 4 * 4];
+        let mut tiny_dst = vec![0u8; 2 * 2 * 4];
+        let mut post_runner = DecodeRunner::new(token);
+        let post_status = downscale_bgra8(
+            ImagePlane {
+                data: &tiny_src,
+                width: 4,
+                height: 4,
+            },
+            ImagePlaneMut {
+                data: &mut tiny_dst,
+                width: 2,
+                height: 2,
+            },
+            false,
+            &mut post_runner,
+            token,
+        );
+        assert_eq!(post_status, Err(CANCELED));
     }
 
     #[test]
@@ -3570,7 +3725,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         unsafe { shutdown() };
-        assert!(GLOBAL_POOL.lock().unwrap().is_none());
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
 
         thread::scope(|s| {
             let mut handles = Vec::new();
@@ -3606,12 +3761,12 @@ mod tests {
         let expected_cap = default_threads().saturating_sub(1);
         if expected_cap > 0 {
             let guard = GLOBAL_POOL.lock().unwrap();
-            let handle = guard.as_ref().expect("global pool created");
+            let handle = guard.handle.as_ref().expect("global pool created");
             assert!(handle.workers.len() <= expected_cap);
         }
 
         unsafe { shutdown() };
-        assert!(GLOBAL_POOL.lock().unwrap().is_none());
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
 
         let post_counts: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
         let mut post_runner = DecodeRunner::new(std::ptr::null_mut());
@@ -3624,7 +3779,77 @@ mod tests {
             .expect("pool lazily recreates after shutdown");
         assert!(post_counts.iter().all(|c| c.load(Ordering::SeqCst) == 1));
         unsafe { shutdown() };
-        assert!(GLOBAL_POOL.lock().unwrap().is_none());
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+    }
+
+    #[test]
+    fn global_worker_pool_blocks_acquisition_and_serializes_shutdown_while_draining() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if default_threads() <= 1 {
+            return;
+        }
+        unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate_job = Arc::clone(&gate);
+        let entered_job = Arc::clone(&entered);
+
+        let job_thread = thread::spawn(move || {
+            let mut runner = DecodeRunner::new(std::ptr::null_mut());
+            runner.max_threads = 2;
+            runner
+                .run_ordered(2, Some(2), &|_| {
+                    entered_job.fetch_add(1, Ordering::SeqCst);
+                    let mut released = gate_job.0.lock().unwrap();
+                    while !*released {
+                        released = gate_job.1.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .expect("in-flight job finishes cleanly");
+        });
+
+        while entered.load(Ordering::SeqCst) < 2 {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let shutdown_t1 = thread::spawn(shutdown_global_pool);
+        while !GLOBAL_POOL.lock().unwrap().shutting_down {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Acquisition while draining must refuse creating a replacement pool.
+        assert!(acquire_global_pool(4).is_none());
+
+        // A concurrent shutdown must wait until the first drain completes.
+        let t2_done = Arc::new(AtomicBool::new(false));
+        let t2_done_clone = Arc::clone(&t2_done);
+        let shutdown_t2 = thread::spawn(move || {
+            shutdown_global_pool();
+            t2_done_clone.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(15));
+        assert!(!t2_done.load(Ordering::Acquire));
+
+        {
+            let mut released = gate.0.lock().unwrap();
+            *released = true;
+            gate.1.notify_all();
+        }
+        job_thread.join().expect("job thread joined");
+        shutdown_t1.join().expect("first shutdown joined");
+        shutdown_t2.join().expect("second shutdown joined");
+
+        assert!(t2_done.load(Ordering::Acquire));
+        {
+            let lifecycle = GLOBAL_POOL.lock().unwrap();
+            assert!(lifecycle.handle.is_none());
+            assert!(!lifecycle.shutting_down);
+        }
     }
 
     #[test]
