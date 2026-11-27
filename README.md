@@ -30,11 +30,11 @@ This plugin implements a native codec for ImageGlass 10 that adds support for JP
   Linux, Mach `host_statistics64` on macOS) so excessive frames return
   `OUT_OF_MEMORY` (note: internal `jxl-rs` / Rust `std` allocations cannot be
   intercepted by `catch_unwind`)
-- **Host integration ceiling:** while the plugin admits frames up to `32000×32000`
+- **Host integration ceiling:** while the plugin admits headers up to `32000×32000`
   (`1,024 MP`), pinned ImageGlass 10 computes `checked(Stride * Height)` in
   signed 32-bit `int` (max `2,147,483,647` bytes ≈ **536.8 MP** for BGRA8), so
-  images larger than ~536.8 MP will throw `OverflowException` on the host side
-  until ImageGlass widens that multiplication
+  decoded frames exceeding that ceiling are automatically downscaled to fit
+  within the 2 GiB host buffer budget instead of throwing `OverflowException`
 
 ## Prerequisites
 
@@ -101,7 +101,7 @@ Release archives also ship platform manifests (`igplugin.json` for Windows,
   "id": "Plugin_JxlCodec",
   "name": "JPEG XL Codec",
   "description": "Native codec plugin for JPEG XL (JXL) image format support using jxl-rs decoder",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "author": "JXL Codec Developer",
   "website": "https://github.com/libjxl/jxl-rs",
   "kind": "Codec",

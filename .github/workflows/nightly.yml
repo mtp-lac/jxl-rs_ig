@@ -99,10 +99,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run nightly unit tests
-        run: cargo test --features upstream-jxl-icc-target
+        run: cargo test --features upstream-jxl-icc-target,upstream-jxl-downsample
 
       - name: Build nightly (release)
-        run: cargo build --release --features upstream-jxl-icc-target
+        run: cargo build --release --features upstream-jxl-icc-target,upstream-jxl-downsample
 
       - name: Plugin smoke test
         run: cargo run --release --manifest-path tests/Cargo.toml
