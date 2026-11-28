@@ -252,7 +252,7 @@ fn main() {
             plugin_api.info.version.length as usize,
         )
     });
-    assert_eq!(plugin_version, "3.0.0");
+    assert_eq!(plugin_version, "4.5.0");
     println!("Plugin loaded: {} v{}", plugin_name, plugin_version);
 
     // Get codec

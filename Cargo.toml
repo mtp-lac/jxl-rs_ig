@@ -1,6 +1,6 @@
 [package]
 name = "jxl_codec"
-version = "3.0.0"
+version = "4.5.0"
 edition = "2021"
 authors = ["JXL Codec Developer"]
 description = "JPEG XL codec plugin for ImageGlass using jxl-rs"
@@ -16,6 +16,9 @@ crate-type = ["cdylib"]
 # Enabled by nightly CI when building against upstream libjxl/jxl-rs `main`
 # where `JxlColorProfile::try_as_icc` takes an `intensity_target: f32` argument.
 upstream-jxl-icc-target = []
+# Enabled by nightly CI when building against upstream libjxl/jxl-rs `main`
+# with native `JxlDecoder::set_downsample_factor(0..=3)` support (post-0.8.0).
+upstream-jxl-downsample = []
 
 [dependencies]
 jxl = "=0.8.0"

@@ -4,7 +4,8 @@
 use jxl::api::{
     check_signature, AlphaMode, Event, ExtraChannel, JxlBasicInfo, JxlBitstreamInput,
     JxlColorEncoding, JxlColorProfile, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions,
-    JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlSignature,
+    JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlPrimaries,
+    JxlSignature, JxlTransferFunction, JxlWhitePoint,
 };
 use jxl::error::Error as JxlError;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -32,6 +33,11 @@ const PIXEL_BGRA8: i32 = 1;
 /// goes through `try_reserve` and failure is reported as OutOfMemory, never abort.
 const MAX_IMAGE_PIXELS: usize = 1_024_000_000; // 32_000 * 32_000
 const MAX_OUTPUT_BYTES: usize = MAX_IMAGE_PIXELS * 4;
+/// ImageGlass's managed `NativeCodecProxy.WrapPluginBufferAsImage` computes
+/// `checked(buffer.Stride * buffer.Height)` in signed 32-bit `int`. Any BGRA8
+/// buffer exceeding `i32::MAX` bytes (~536.8 MP, e.g. 32000x18000) throws
+/// `OverflowException` in the host even if decoding succeeds.
+const MAX_HOST_BUFFER_BYTES: usize = i32::MAX as usize;
 
 /// jxl-rs `sample_limit` counts `pixels * (3 + extra_channels)` and rejects when
 /// `total >= limit` (see `check_size_limit` in the crate). For a 4-sample image
@@ -705,74 +711,151 @@ struct ErasedJob(*const (dyn Fn(usize) -> Result<(), JxlError> + Sync));
 unsafe impl Send for ErasedJob {}
 unsafe impl Sync for ErasedJob {}
 
-struct PoolState {
-    generation: u64,
-    shutdown: bool,
-    job: Option<ErasedJob>,
-    num_tasks: usize,
-    helper_limit: usize,
-    pending_helpers: usize,
+struct JobState {
+    active_helpers: usize,
     first_error: Option<JxlError>,
     panic: Option<Box<dyn std::any::Any + Send + 'static>>,
 }
 
-struct SharedPool {
-    state: Mutex<PoolState>,
-    work_cv: Condvar,
-    done_cv: Condvar,
+struct Job {
+    fun: ErasedJob,
+    num_tasks: usize,
+    helper_limit: usize,
     next_task: AtomicUsize,
     stop: AtomicBool,
     canceled: AtomicBool,
     cancel_token: usize,
+    state: Mutex<JobState>,
+    done_cv: Condvar,
 }
 
-/// Per-decode lazy worker pool implementing `JxlParallelRunner`.
+struct PoolQueueState {
+    shutdown: bool,
+    jobs: VecDeque<Arc<Job>>,
+}
+
+struct GlobalPool {
+    state: Mutex<PoolQueueState>,
+    work_cv: Condvar,
+}
+
+struct GlobalPoolHandle {
+    pool: Arc<GlobalPool>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+struct PoolLifecycle {
+    shutting_down: bool,
+    handle: Option<GlobalPoolHandle>,
+}
+
+static GLOBAL_POOL: Mutex<PoolLifecycle> = Mutex::new(PoolLifecycle {
+    shutting_down: false,
+    handle: None,
+});
+static GLOBAL_POOL_DRAINED: Condvar = Condvar::new();
+
+fn acquire_global_pool(desired_helpers: usize) -> Option<Arc<GlobalPool>> {
+    let cap = default_threads().saturating_sub(1);
+    if cap == 0 || desired_helpers == 0 {
+        return None;
+    }
+    let target_workers = desired_helpers.min(cap);
+    let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if lifecycle.shutting_down {
+        return None;
+    }
+    let handle = lifecycle.handle.get_or_insert_with(|| GlobalPoolHandle {
+        pool: Arc::new(GlobalPool {
+            state: Mutex::new(PoolQueueState {
+                shutdown: false,
+                jobs: VecDeque::new(),
+            }),
+            work_cv: Condvar::new(),
+        }),
+        workers: Vec::new(),
+    });
+    for worker_id in handle.workers.len()..target_workers {
+        let pool = Arc::clone(&handle.pool);
+        match thread::Builder::new()
+            .name(format!("jxl-worker-{worker_id}"))
+            .spawn(move || global_worker_loop(pool))
+        {
+            Ok(worker) => handle.workers.push(worker),
+            Err(_) => break,
+        }
+    }
+    if handle.workers.is_empty() {
+        return None;
+    }
+    Some(Arc::clone(&handle.pool))
+}
+
+struct ShutdownDrainGuard;
+
+impl Drop for ShutdownDrainGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        lifecycle.shutting_down = false;
+        GLOBAL_POOL_DRAINED.notify_all();
+    }
+}
+
+fn shutdown_global_pool() {
+    let mut handle = {
+        let mut lifecycle = GLOBAL_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        while lifecycle.shutting_down {
+            lifecycle = GLOBAL_POOL_DRAINED
+                .wait(lifecycle)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let Some(handle) = lifecycle.handle.take() else {
+            return;
+        };
+        lifecycle.shutting_down = true;
+        handle
+    };
+    let _drain_guard = ShutdownDrainGuard;
+    {
+        let mut st = handle.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.shutdown = true;
+    }
+    handle.pool.work_cv.notify_all();
+    for worker in handle.workers.drain(..) {
+        let _ = worker.join();
+    }
+}
+
+/// Parallel task runner backed by the plugin's bounded global worker pool.
 ///
-/// Worker threads are spawned lazily up to `available_parallelism() - 1` and
-/// reused across all `run_ordered` phases of a single `decode_static_raster`
-/// call, then joined on `Drop` so no background threads outlive an FFI call or
-/// block Windows `FreeLibrary` DLL unload.
+/// Shares at most `available_parallelism() - 1` helper threads across all
+/// concurrent decode and thumbnail-downscale calls, avoiding per-decode thread
+/// creation/teardown overhead and multi-decode CPU oversubscription while still
+/// draining cleanly on `shutdown()` before DLL unload.
 struct DecodeRunner {
     max_threads: usize,
-    shared: Arc<SharedPool>,
-    workers: Vec<JoinHandle<()>>,
+    cancel_token: usize,
+    canceled: AtomicBool,
 }
 
 impl DecodeRunner {
     fn new(cancel: *mut c_void) -> Self {
         Self {
             max_threads: default_threads(),
-            shared: Arc::new(SharedPool {
-                state: Mutex::new(PoolState {
-                    generation: 0,
-                    shutdown: false,
-                    job: None,
-                    num_tasks: 0,
-                    helper_limit: 0,
-                    pending_helpers: 0,
-                    first_error: None,
-                    panic: None,
-                }),
-                work_cv: Condvar::new(),
-                done_cv: Condvar::new(),
-                next_task: AtomicUsize::new(0),
-                stop: AtomicBool::new(false),
-                canceled: AtomicBool::new(false),
-                cancel_token: cancel as usize,
-            }),
-            workers: Vec::new(),
+            cancel_token: cancel as usize,
+            canceled: AtomicBool::new(false),
         }
     }
 
     fn was_canceled(&self) -> bool {
-        self.shared.canceled.load(Ordering::Acquire)
+        self.canceled.load(Ordering::Acquire)
     }
 
     fn run_serial(&self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> Result<(), JxlError> {
-        let cancel = self.shared.cancel_token as *mut c_void;
+        let cancel = self.cancel_token as *mut c_void;
         for i in 0..num {
             if canceled(cancel) {
-                self.shared.canceled.store(true, Ordering::Release);
+                self.canceled.store(true, Ordering::Release);
                 return Err(JxlError::IOError(std::io::Error::other("canceled")));
             }
             fun(i)?;
@@ -781,83 +864,119 @@ impl DecodeRunner {
     }
 }
 
-fn run_tasks(shared: &SharedPool, job: ErasedJob, num_tasks: usize) -> Result<(), JxlError> {
-    let cancel = shared.cancel_token as *mut c_void;
+fn run_job_tasks(job: &Job) -> Result<(), JxlError> {
+    let cancel = job.cancel_token as *mut c_void;
     loop {
-        if shared.stop.load(Ordering::Acquire) {
+        if job.stop.load(Ordering::Acquire) {
             return Ok(());
         }
         if canceled(cancel) {
-            shared.canceled.store(true, Ordering::Release);
-            shared.stop.store(true, Ordering::Release);
+            job.canceled.store(true, Ordering::Release);
+            job.stop.store(true, Ordering::Release);
             return Err(JxlError::IOError(std::io::Error::other("canceled")));
         }
-        let t = shared.next_task.fetch_add(1, Ordering::Relaxed);
-        if t >= num_tasks {
+        let t = job.next_task.fetch_add(1, Ordering::Relaxed);
+        if t >= job.num_tasks {
             return Ok(());
         }
-        // SAFETY: `job` points to the `fun` trait object alive on the caller's
+        // SAFETY: `job.fun` points to the `fun` trait object alive on the caller's
         // stack while `JobFinishGuard` keeps `run_ordered` blocked until all
-        // helpers finish and drop `job`.
-        unsafe { (*job.0)(t)? };
+        // active helpers finish and `job` is removed from `GlobalPool`.
+        unsafe { (*job.fun.0)(t)? };
     }
 }
 
-fn worker_loop(shared: Arc<SharedPool>, worker_id: usize, initial_gen: u64) {
-    let mut seen_gen = initial_gen;
+struct WorkerActiveGuard<'a>(&'a Job);
+
+impl Drop for WorkerActiveGuard<'_> {
+    fn drop(&mut self) {
+        let mut jst = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        jst.active_helpers -= 1;
+        if jst.active_helpers == 0 {
+            self.0.done_cv.notify_one();
+        }
+    }
+}
+
+fn pick_next_job(st: &PoolQueueState) -> Option<Arc<Job>> {
+    let mut best: Option<(Arc<Job>, usize)> = None;
+    for candidate in &st.jobs {
+        if candidate.stop.load(Ordering::Acquire)
+            || candidate.next_task.load(Ordering::Relaxed) >= candidate.num_tasks
+        {
+            continue;
+        }
+        let jst = candidate.state.lock().unwrap_or_else(|e| e.into_inner());
+        if jst.active_helpers < candidate.helper_limit
+            && best
+                .as_ref()
+                .is_none_or(|(_, best_active)| jst.active_helpers < *best_active)
+        {
+            best = Some((Arc::clone(candidate), jst.active_helpers));
+        }
+    }
+    best.map(|(job, _)| job)
+}
+
+fn global_worker_loop(pool: Arc<GlobalPool>) {
     loop {
-        let (job, num_tasks) = {
-            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let job = {
+            let mut st = pool.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if st.shutdown {
                     return;
                 }
-                if st.generation != seen_gen {
-                    seen_gen = st.generation;
-                    if worker_id < st.helper_limit {
-                        if let Some(job) = st.job {
-                            break (job, st.num_tasks);
-                        }
+                if let Some(job) = pick_next_job(&st) {
+                    let mut jst = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if jst.active_helpers < job.helper_limit {
+                        jst.active_helpers += 1;
+                        drop(jst);
+                        break job;
                     }
                 }
-                st = shared.work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                st = pool.work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         };
 
-        let res = catch_unwind(AssertUnwindSafe(|| run_tasks(&shared, job, num_tasks)));
-        let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let active_guard = WorkerActiveGuard(&job);
+        let res = catch_unwind(AssertUnwindSafe(|| run_job_tasks(&job)));
         match res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                shared.stop.store(true, Ordering::Release);
-                if st.first_error.is_none() {
-                    st.first_error = Some(e);
+                job.stop.store(true, Ordering::Release);
+                let mut jst = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                if jst.first_error.is_none() {
+                    jst.first_error = Some(e);
                 }
             }
             Err(p) => {
-                shared.stop.store(true, Ordering::Release);
-                if st.panic.is_none() {
-                    st.panic = Some(p);
+                job.stop.store(true, Ordering::Release);
+                let mut jst = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                if jst.panic.is_none() {
+                    jst.panic = Some(p);
                 }
             }
         }
-        st.pending_helpers -= 1;
-        if st.pending_helpers == 0 {
-            shared.done_cv.notify_one();
-        }
+        drop(active_guard);
     }
 }
 
-struct JobFinishGuard<'a>(&'a SharedPool);
+struct JobFinishGuard<'a> {
+    pool: &'a GlobalPool,
+    job: &'a Arc<Job>,
+}
 
 impl Drop for JobFinishGuard<'_> {
     fn drop(&mut self) {
-        self.0.stop.store(true, Ordering::Release);
-        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        while st.pending_helpers > 0 {
-            st = self.0.done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        self.job.stop.store(true, Ordering::Release);
+        {
+            let mut st = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.jobs.retain(|j| !Arc::ptr_eq(j, self.job));
         }
-        st.job = None;
+        let mut jst = self.job.state.lock().unwrap_or_else(|e| e.into_inner());
+        while jst.active_helpers > 0 {
+            jst = self.job.done_cv.wait(jst).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -876,9 +995,9 @@ impl JxlParallelRunner for DecodeRunner {
         max_threads: Option<usize>,
         fun: &JxlParallelRunnerFun<'_>,
     ) -> Result<(), JxlError> {
-        let cancel = self.shared.cancel_token as *mut c_void;
+        let cancel = self.cancel_token as *mut c_void;
         if canceled(cancel) {
-            self.shared.canceled.store(true, Ordering::Release);
+            self.canceled.store(true, Ordering::Release);
             return Err(JxlError::IOError(std::io::Error::other("canceled")));
         }
 
@@ -890,64 +1009,61 @@ impl JxlParallelRunner for DecodeRunner {
             return self.run_serial(num, fun);
         }
 
-        let mut helpers = total_workers - 1;
-        if self.workers.len() < helpers {
-            let current_gen = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .generation;
-            for worker_id in self.workers.len()..helpers {
-                let shared = Arc::clone(&self.shared);
-                match thread::Builder::new().spawn(move || {
-                    worker_loop(shared, worker_id, current_gen);
-                }) {
-                    Ok(handle) => self.workers.push(handle),
-                    Err(_) => break,
-                }
-            }
-            helpers = self.workers.len();
-        }
-
-        if helpers == 0 {
+        let helpers = total_workers - 1;
+        let Some(pool) = acquire_global_pool(helpers) else {
             return self.run_serial(num, fun);
-        }
+        };
 
-        self.shared.next_task.store(0, Ordering::Release);
-        self.shared.stop.store(false, Ordering::Release);
-
-        // SAFETY: `fun` stays alive on this stack frame until `guard` drops
-        // and guarantees all helper threads have exited `run_tasks`.
+        // SAFETY: `fun` stays alive on this stack frame until `guard` drops,
+        // removes `job` from `pool`, and waits for all helpers to finish.
         let erased = ErasedJob(unsafe {
             std::mem::transmute::<
                 &JxlParallelRunnerFun<'_>,
                 &'static (dyn Fn(usize) -> Result<(), JxlError> + Sync),
             >(fun) as *const _
         });
+        let job = Arc::new(Job {
+            fun: erased,
+            num_tasks: num,
+            helper_limit: helpers,
+            next_task: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            canceled: AtomicBool::new(false),
+            cancel_token: self.cancel_token,
+            state: Mutex::new(JobState {
+                active_helpers: 0,
+                first_error: None,
+                panic: None,
+            }),
+            done_cv: Condvar::new(),
+        });
 
         {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.job = Some(erased);
-            st.num_tasks = num;
-            st.helper_limit = helpers;
-            st.pending_helpers = helpers;
-            st.first_error = None;
-            st.panic = None;
-            st.generation = st.generation.wrapping_add(1);
+            let mut st = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.shutdown {
+                drop(st);
+                return self.run_serial(num, fun);
+            }
+            st.jobs.push_back(Arc::clone(&job));
         }
-        self.shared.work_cv.notify_all();
+        let guard = JobFinishGuard {
+            pool: &pool,
+            job: &job,
+        };
+        pool.work_cv.notify_all();
 
-        let guard = JobFinishGuard(&self.shared);
-        let main_res = run_tasks(&self.shared, erased, num);
+        let main_res = run_job_tasks(&job);
         if main_res.is_err() {
-            self.shared.stop.store(true, Ordering::Release);
+            job.stop.store(true, Ordering::Release);
         }
         drop(guard);
 
+        if job.canceled.load(Ordering::Acquire) {
+            self.canceled.store(true, Ordering::Release);
+        }
         let (panic, first_error) = {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            (st.panic.take(), st.first_error.take())
+            let mut jst = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            (jst.panic.take(), jst.first_error.take())
         };
         if let Some(p) = panic {
             std::panic::resume_unwind(p);
@@ -957,19 +1073,6 @@ impl JxlParallelRunner for DecodeRunner {
             return Err(err);
         }
         Ok(())
-    }
-}
-
-impl Drop for DecodeRunner {
-    fn drop(&mut self) {
-        {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.shutdown = true;
-        }
-        self.shared.work_cv.notify_all();
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -1025,22 +1128,7 @@ impl AlignedBuffer {
     }
 
     fn into_pixel_buffer(self, width: usize, height: usize) -> Result<IGPixelBuffer, IGStatus> {
-        if width == 0 || height == 0 {
-            return Err(DECODE_FAILED);
-        }
-        let w = i32::try_from(width).map_err(|_| DECODE_FAILED)?;
-        let h = i32::try_from(height).map_err(|_| DECODE_FAILED)?;
-        let stride = width
-            .checked_mul(4)
-            .and_then(|s| i32::try_from(s).ok())
-            .ok_or(DECODE_FAILED)?;
-        let needed = width
-            .checked_mul(height)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or(DECODE_FAILED)?;
-        if needed > self.len {
-            return Err(DECODE_FAILED);
-        }
+        let (w, h, stride) = validate_pixel_buffer_layout(self.len, width, height)?;
         let data = self.ptr.as_ptr();
         let release_context = self.len as *mut c_void;
         std::mem::forget(self);
@@ -1053,6 +1141,30 @@ impl AlignedBuffer {
             release_context,
         })
     }
+}
+
+fn validate_pixel_buffer_layout(
+    buf_len: usize,
+    width: usize,
+    height: usize,
+) -> Result<(i32, i32, i32), IGStatus> {
+    if width == 0 || height == 0 {
+        return Err(DECODE_FAILED);
+    }
+    let w = i32::try_from(width).map_err(|_| DECODE_FAILED)?;
+    let h = i32::try_from(height).map_err(|_| DECODE_FAILED)?;
+    let stride = width
+        .checked_mul(4)
+        .and_then(|s| i32::try_from(s).ok())
+        .ok_or(DECODE_FAILED)?;
+    let needed = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(DECODE_FAILED)?;
+    if needed > MAX_HOST_BUFFER_BYTES || needed > buf_len {
+        return Err(DECODE_FAILED);
+    }
+    Ok((w, h, stride))
 }
 
 impl Drop for AlignedBuffer {
@@ -1236,6 +1348,7 @@ impl PluginState {
 
 unsafe extern "C" fn shutdown() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        shutdown_global_pool();
         let Some(state) = STATE.get() else {
             return;
         };
@@ -1384,6 +1497,29 @@ fn is_cmyk_decoder(decoder: &JxlDecoder) -> bool {
     decoder
         .output_color_profile()
         .is_some_and(|profile| profile.is_cmyk())
+}
+
+/// Returns true when a `JxlColorProfile::Simple` descriptor represents
+/// standard sRGB (or sRGB-transfer D65 grayscale, which decodes to neutral
+/// sRGB BGRA8). Omitting a synthesized ICC profile avoids forcing ImageGlass
+/// onto its single-threaded Skia ICC color-conversion path and preserves its
+/// cached display bitmap, while embedded `JxlColorProfile::Icc` and non-sRGB
+/// `Simple` profiles (Display P3, Rec.2020, Linear, PQ, HLG, etc.) are still
+/// emitted normally.
+fn is_standard_srgb_encoding(enc: &JxlColorEncoding) -> bool {
+    matches!(
+        enc,
+        JxlColorEncoding::RgbColorSpace {
+            white_point: JxlWhitePoint::D65,
+            primaries: JxlPrimaries::SRGB,
+            transfer_function: JxlTransferFunction::SRGB,
+            ..
+        } | JxlColorEncoding::GrayscaleColorSpace {
+            white_point: JxlWhitePoint::D65,
+            transfer_function: JxlTransferFunction::SRGB,
+            ..
+        }
+    )
 }
 
 fn map_jxl_err(err: JxlError, input: &FileInput, cancel: *mut c_void) -> IGStatus {
@@ -1591,6 +1727,106 @@ fn fit_within_box(src_w: usize, src_h: usize, max_w: usize, max_h: usize) -> (us
     }
 }
 
+const MAX_HOST_PIXELS: usize = MAX_HOST_BUFFER_BYTES / 4;
+
+/// Scales `(width, height)` down proportionally only when its uncompressed BGRA8
+/// size exceeds `MAX_HOST_BUFFER_BYTES` (`i32::MAX` bytes).
+fn fit_within_host_budget(width: usize, height: usize) -> (usize, usize) {
+    if width == 0 || height == 0 {
+        return (width, height);
+    }
+    if width
+        .checked_mul(height)
+        .is_some_and(|p| p <= MAX_HOST_PIXELS)
+    {
+        return (width, height);
+    }
+    let scale = ((MAX_HOST_PIXELS as f64) / ((width as f64) * (height as f64))).sqrt();
+    let mut fit_w = (((width as f64) * scale).floor() as usize).clamp(1, width);
+    let mut fit_h = (((height as f64) * scale).floor() as usize).clamp(1, height);
+    if fit_w
+        .checked_mul(fit_h)
+        .is_none_or(|p| p > MAX_HOST_PIXELS)
+    {
+        if fit_w >= fit_h {
+            fit_w = (MAX_HOST_PIXELS / fit_h).clamp(1, width);
+            if fit_w
+                .checked_mul(fit_h)
+                .is_none_or(|p| p > MAX_HOST_PIXELS)
+            {
+                fit_h = (MAX_HOST_PIXELS / fit_w).clamp(1, height);
+            }
+        } else {
+            fit_h = (MAX_HOST_PIXELS / fit_w).clamp(1, height);
+            if fit_w
+                .checked_mul(fit_h)
+                .is_none_or(|p| p > MAX_HOST_PIXELS)
+            {
+                fit_w = (MAX_HOST_PIXELS / fit_h).clamp(1, width);
+            }
+        }
+    }
+    (fit_w, fit_h)
+}
+
+#[cfg_attr(not(feature = "upstream-jxl-downsample"), allow(dead_code))]
+fn choose_downsample_shift(src_w: usize, src_h: usize, target_w: usize, target_h: usize) -> u8 {
+    for shift in (1u8..=3).rev() {
+        let factor = 1usize << shift;
+        if src_w.div_ceil(factor) >= target_w && src_h.div_ceil(factor) >= target_h {
+            return shift;
+        }
+    }
+    0
+}
+
+#[cfg_attr(not(feature = "upstream-jxl-downsample"), allow(dead_code))]
+fn choose_host_budget_shift(src_w: usize, src_h: usize) -> u8 {
+    for shift in 1u8..=3 {
+        let factor = 1usize << shift;
+        let dw = src_w.div_ceil(factor);
+        let dh = src_h.div_ceil(factor);
+        if dw
+            .checked_mul(dh)
+            .and_then(|n| n.checked_mul(4))
+            .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES)
+        {
+            return shift;
+        }
+    }
+    3
+}
+
+#[cfg(feature = "upstream-jxl-downsample")]
+fn apply_native_downsample(
+    decoder: &mut PooledDecoder,
+    width: usize,
+    height: usize,
+    shift: u8,
+) -> (usize, usize) {
+    if shift > 0 && decoder.set_downsample_factor(shift).is_ok() {
+        let (dec_w, dec_h) = decoder
+            .basic_info()
+            .map(|b| b.size)
+            .unwrap_or((width, height));
+        if dec_w > 0 && dec_h > 0 {
+            decoder.set_recycle(dec_w.saturating_mul(dec_h) <= DECODER_POOL_MAX_PIXELS);
+            return (dec_w, dec_h);
+        }
+    }
+    (width, height)
+}
+
+#[cfg(not(feature = "upstream-jxl-downsample"))]
+fn apply_native_downsample(
+    _decoder: &mut PooledDecoder,
+    width: usize,
+    height: usize,
+    _shift: u8,
+) -> (usize, usize) {
+    (width, height)
+}
+
 #[derive(Clone, Copy)]
 struct SendMutPtr(*mut u8);
 
@@ -1614,6 +1850,139 @@ struct ImagePlaneMut<'a> {
     data: &'a mut [u8],
     width: usize,
     height: usize,
+}
+
+const TILE_DST_W: usize = 256;
+const DOWNSCALE_CANCEL_POLL_PIXELS: usize = 64 * 1024;
+
+fn downscale_row_opaque(
+    src_data: &[u8],
+    src_stride: usize,
+    x_spans: &[(usize, usize)],
+    y0: usize,
+    y1: usize,
+    dst_row: &mut [u8],
+    cancel_token: usize,
+) -> Result<(), JxlError> {
+    let dy_count = (y1 - y0) as u64;
+    let mut pixels_since_poll: usize = 0;
+    for (tile_idx, tile_spans) in x_spans.chunks(TILE_DST_W).enumerate() {
+        let mut acc = [[0u64; 3]; TILE_DST_W];
+        let tile_start = tile_idx * TILE_DST_W;
+        for sy in y0..y1 {
+            if ((sy - y0) & 63) == 63 && canceled(cancel_token as *mut c_void) {
+                return Err(JxlError::IOError(std::io::Error::other("canceled")));
+            }
+            let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
+            for (local_dx, &(x0, x1)) in tile_spans.iter().enumerate() {
+                let mut b = 0u64;
+                let mut g = 0u64;
+                let mut r = 0u64;
+                for span_chunk in row[x0 * 4..x1 * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .chunks(DOWNSCALE_CANCEL_POLL_PIXELS)
+                {
+                    for px in span_chunk {
+                        b += px[0] as u64;
+                        g += px[1] as u64;
+                        r += px[2] as u64;
+                    }
+                    pixels_since_poll += span_chunk.len();
+                    if pixels_since_poll >= DOWNSCALE_CANCEL_POLL_PIXELS {
+                        pixels_since_poll = 0;
+                        if canceled(cancel_token as *mut c_void) {
+                            return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                        }
+                    }
+                }
+                acc[local_dx][0] += b;
+                acc[local_dx][1] += g;
+                acc[local_dx][2] += r;
+            }
+        }
+        for (local_dx, &(x0, x1)) in tile_spans.iter().enumerate() {
+            let count = ((x1 - x0) as u64) * dy_count;
+            let half = count / 2;
+            let out = (tile_start + local_dx) * 4;
+            dst_row[out] = ((acc[local_dx][0] + half) / count) as u8;
+            dst_row[out + 1] = ((acc[local_dx][1] + half) / count) as u8;
+            dst_row[out + 2] = ((acc[local_dx][2] + half) / count) as u8;
+            dst_row[out + 3] = 255;
+        }
+    }
+    Ok(())
+}
+
+fn downscale_row_alpha(
+    src_data: &[u8],
+    src_stride: usize,
+    x_spans: &[(usize, usize)],
+    y0: usize,
+    y1: usize,
+    dst_row: &mut [u8],
+    cancel_token: usize,
+) -> Result<(), JxlError> {
+    let dy_count = (y1 - y0) as u64;
+    let mut pixels_since_poll: usize = 0;
+    for (tile_idx, tile_spans) in x_spans.chunks(TILE_DST_W).enumerate() {
+        let mut acc = [[0u64; 4]; TILE_DST_W];
+        let tile_start = tile_idx * TILE_DST_W;
+        for sy in y0..y1 {
+            if ((sy - y0) & 63) == 63 && canceled(cancel_token as *mut c_void) {
+                return Err(JxlError::IOError(std::io::Error::other("canceled")));
+            }
+            let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
+            for (local_dx, &(x0, x1)) in tile_spans.iter().enumerate() {
+                let mut ba = 0u64;
+                let mut ga = 0u64;
+                let mut ra = 0u64;
+                let mut a_sum = 0u64;
+                for span_chunk in row[x0 * 4..x1 * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .chunks(DOWNSCALE_CANCEL_POLL_PIXELS)
+                {
+                    for px in span_chunk {
+                        let a = px[3] as u64;
+                        ba += (px[0] as u64) * a;
+                        ga += (px[1] as u64) * a;
+                        ra += (px[2] as u64) * a;
+                        a_sum += a;
+                    }
+                    pixels_since_poll += span_chunk.len();
+                    if pixels_since_poll >= DOWNSCALE_CANCEL_POLL_PIXELS {
+                        pixels_since_poll = 0;
+                        if canceled(cancel_token as *mut c_void) {
+                            return Err(JxlError::IOError(std::io::Error::other("canceled")));
+                        }
+                    }
+                }
+                acc[local_dx][0] += ba;
+                acc[local_dx][1] += ga;
+                acc[local_dx][2] += ra;
+                acc[local_dx][3] += a_sum;
+            }
+        }
+        for (local_dx, &(x0, x1)) in tile_spans.iter().enumerate() {
+            let count = ((x1 - x0) as u64) * dy_count;
+            let out = (tile_start + local_dx) * 4;
+            let sum_a = acc[local_dx][3];
+            let out_a = ((sum_a + count / 2) / count) as u8;
+            if sum_a > 0 {
+                let half_a = sum_a / 2;
+                dst_row[out] = ((acc[local_dx][0] + half_a) / sum_a).min(255) as u8;
+                dst_row[out + 1] = ((acc[local_dx][1] + half_a) / sum_a).min(255) as u8;
+                dst_row[out + 2] = ((acc[local_dx][2] + half_a) / sum_a).min(255) as u8;
+            } else {
+                dst_row[out] = 0;
+                dst_row[out + 1] = 0;
+                dst_row[out + 2] = 0;
+            }
+            dst_row[out + 3] = out_a;
+        }
+    }
+    Ok(())
 }
 
 fn downscale_bgra8(
@@ -1661,7 +2030,13 @@ fn downscale_bgra8(
     }
     let src_data = src.data;
     let dst_base = SendMutPtr(dst.data.as_mut_ptr());
-    let max_threads = dst_h.div_ceil(16).max(1);
+    let cancel_token = cancel as usize;
+    let src_pixels = src_w.saturating_mul(src_h);
+    let max_threads = if src_pixels < 64 * 1024 {
+        1
+    } else {
+        (src_pixels / (64 * 1024)).clamp(1, dst_h)
+    };
     let res = runner.run_ordered(dst_h, Some(max_threads), &|dy| {
         let y0 = ((dy as u128 * src_h as u128) / dst_h as u128) as usize;
         let y1 = ((((dy + 1) as u128 * src_h as u128) / dst_h as u128) as usize)
@@ -1672,64 +2047,35 @@ fn downscale_bgra8(
         let dst_row =
             unsafe { std::slice::from_raw_parts_mut(dst_base.add(dy * dst_stride), dst_stride) };
         if !has_alpha {
-            for (dx, &(x0, x1)) in x_spans.iter().enumerate() {
-                let mut sum_b = 0u64;
-                let mut sum_g = 0u64;
-                let mut sum_r = 0u64;
-                for sy in y0..y1 {
-                    let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
-                    for sx in x0..x1 {
-                        let off = sx * 4;
-                        sum_b += row[off] as u64;
-                        sum_g += row[off + 1] as u64;
-                        sum_r += row[off + 2] as u64;
-                    }
-                }
-                let count = ((x1 - x0) as u64) * ((y1 - y0) as u64);
-                let half = count / 2;
-                let out = dx * 4;
-                dst_row[out] = ((sum_b + half) / count) as u8;
-                dst_row[out + 1] = ((sum_g + half) / count) as u8;
-                dst_row[out + 2] = ((sum_r + half) / count) as u8;
-                dst_row[out + 3] = 255;
-            }
+            downscale_row_opaque(
+                src_data,
+                src_stride,
+                &x_spans,
+                y0,
+                y1,
+                dst_row,
+                cancel_token,
+            )
         } else {
-            for (dx, &(x0, x1)) in x_spans.iter().enumerate() {
-                let mut sum_ba = 0u64;
-                let mut sum_ga = 0u64;
-                let mut sum_ra = 0u64;
-                let mut sum_a = 0u64;
-                for sy in y0..y1 {
-                    let row = &src_data[sy * src_stride..(sy + 1) * src_stride];
-                    for sx in x0..x1 {
-                        let off = sx * 4;
-                        let a = row[off + 3] as u64;
-                        sum_ba += (row[off] as u64) * a;
-                        sum_ga += (row[off + 1] as u64) * a;
-                        sum_ra += (row[off + 2] as u64) * a;
-                        sum_a += a;
-                    }
-                }
-                let count = ((x1 - x0) as u64) * ((y1 - y0) as u64);
-                let out = dx * 4;
-                let out_a = ((sum_a + count / 2) / count) as u8;
-                if sum_a > 0 {
-                    let half_a = sum_a / 2;
-                    dst_row[out] = ((sum_ba + half_a) / sum_a).min(255) as u8;
-                    dst_row[out + 1] = ((sum_ga + half_a) / sum_a).min(255) as u8;
-                    dst_row[out + 2] = ((sum_ra + half_a) / sum_a).min(255) as u8;
-                } else {
-                    dst_row[out] = 0;
-                    dst_row[out + 1] = 0;
-                    dst_row[out + 2] = 0;
-                }
-                dst_row[out + 3] = out_a;
-            }
+            downscale_row_alpha(
+                src_data,
+                src_stride,
+                &x_spans,
+                y0,
+                y1,
+                dst_row,
+                cancel_token,
+            )
         }
-        Ok(())
     });
     match res {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if runner.was_canceled() || canceled(cancel) {
+                Err(CANCELED)
+            } else {
+                Ok(())
+            }
+        }
         Err(_) if runner.was_canceled() || canceled(cancel) => Err(CANCELED),
         Err(_) => {
             log_host(LOG_ERROR, "jxl_codec: parallel thumbnail downscale failed");
@@ -1813,12 +2159,17 @@ unsafe extern "C" fn load_metadata(
                     );
                     return UNSUPPORTED;
                 }
-                let Ok(mut store) = STATE.get().expect("plugin initialized").icc.lock() else {
-                    return INTERNAL;
-                };
-                store
-                    .retain_profile(profile, intensity_target)
-                    .unwrap_or((std::ptr::null(), 0))
+                if matches!(profile, JxlColorProfile::Simple(enc) if is_standard_srgb_encoding(enc))
+                {
+                    (std::ptr::null(), 0)
+                } else {
+                    let Ok(mut store) = STATE.get().expect("plugin initialized").icc.lock() else {
+                        return INTERNAL;
+                    };
+                    store
+                        .retain_profile(profile, intensity_target)
+                        .unwrap_or((std::ptr::null(), 0))
+                }
             }
             None => (std::ptr::null(), 0),
         };
@@ -1910,6 +2261,101 @@ unsafe fn open_decode_session(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ScaledDecodeTarget {
+    dec_w: usize,
+    dec_h: usize,
+    out_w: usize,
+    out_h: usize,
+    alpha: bool,
+    extra_channels: usize,
+}
+
+fn decode_direct_or_downscaled(
+    mut decoder: PooledDecoder,
+    input: &mut FileInput,
+    target: ScaledDecodeTarget,
+    cancel: *mut c_void,
+) -> Result<IGPixelBuffer, IGStatus> {
+    if target.dec_w == target.out_w && target.dec_h == target.out_h {
+        let mut pixels =
+            allocate_checked_frame(target.dec_w, target.dec_h, input.compressed_margin())?;
+        let mut runner = DecodeRunner::new(cancel);
+        decode_full_frame(
+            &mut decoder,
+            input,
+            &mut pixels,
+            FrameSpec {
+                width: target.dec_w,
+                height: target.dec_h,
+                extra_channels: target.extra_channels,
+            },
+            &mut runner,
+            cancel,
+        )?;
+        drop(decoder);
+        return pixels.into_pixel_buffer(target.out_w, target.out_h);
+    }
+
+    let out_bytes = target
+        .out_w
+        .checked_mul(target.out_h)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n <= MAX_HOST_BUFFER_BYTES && n <= isize::MAX as usize)
+        .ok_or(DECODE_FAILED)?;
+    let mut dec_pixels = allocate_checked_frame(
+        target.dec_w,
+        target.dec_h,
+        out_bytes.saturating_add(input.compressed_margin()),
+    )?;
+    let mut runner = DecodeRunner::new(cancel);
+    // Decode to frame completion before downscaling; `flush_pixels() == Ok(true)`
+    // only indicates partial dirty-region updates rather than whole-frame coverage.
+    decode_full_frame(
+        &mut decoder,
+        input,
+        &mut dec_pixels,
+        FrameSpec {
+            width: target.dec_w,
+            height: target.dec_h,
+            extra_channels: target.extra_channels,
+        },
+        &mut runner,
+        cancel,
+    )?;
+    // Release `jxl-rs` working buffers before faulting output pages.
+    drop(decoder);
+
+    let Some(mut out_pixels) = AlignedBuffer::alloc_zeroed(out_bytes) else {
+        log_host(
+            LOG_ERROR,
+            &format!(
+                "jxl_codec: downscaled buffer allocation failed ({}x{})",
+                target.out_w, target.out_h
+            ),
+        );
+        return Err(OUT_OF_MEMORY);
+    };
+    downscale_bgra8(
+        ImagePlane {
+            data: dec_pixels.as_slice(),
+            width: target.dec_w,
+            height: target.dec_h,
+        },
+        ImagePlaneMut {
+            data: out_pixels.as_mut_slice(),
+            width: target.out_w,
+            height: target.out_h,
+        },
+        target.alpha,
+        &mut runner,
+        cancel,
+    )?;
+    drop(dec_pixels);
+
+    out_pixels.into_pixel_buffer(target.out_w, target.out_h)
+}
+
 unsafe extern "C" fn decode_static_raster(
     path: IGStringRef,
     frame: i32,
@@ -1932,32 +2378,65 @@ unsafe extern "C" fn decode_static_raster(
             Ok(s) => s,
             Err(status) => return status,
         };
-        let mut pixels = match allocate_checked_frame(
-            session.width,
-            session.height,
-            session.input.compressed_margin(),
-        ) {
-            Ok(b) => b,
-            Err(status) => return status,
+        let (out_w, out_h) = fit_within_host_budget(session.width, session.height);
+        let target = if out_w == session.width && out_h == session.height {
+            ScaledDecodeTarget {
+                dec_w: session.width,
+                dec_h: session.height,
+                out_w: session.width,
+                out_h: session.height,
+                alpha: session.alpha,
+                extra_channels: session.extra_channels,
+            }
+        } else {
+            let shift = choose_host_budget_shift(session.width, session.height);
+            let (dec_w, dec_h) =
+                apply_native_downsample(&mut session.decoder, session.width, session.height, shift);
+            let native_fits = dec_w
+                .checked_mul(dec_h)
+                .and_then(|n| n.checked_mul(4))
+                .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES);
+            if native_fits {
+                log_host(
+                    LOG_WARN,
+                    &format!(
+                        "jxl_codec: oversized image {}x{} natively downsampled to {}x{} to fit 2 GiB host buffer limit",
+                        session.width, session.height, dec_w, dec_h
+                    ),
+                );
+                ScaledDecodeTarget {
+                    dec_w,
+                    dec_h,
+                    out_w: dec_w,
+                    out_h: dec_h,
+                    alpha: session.alpha,
+                    extra_channels: session.extra_channels,
+                }
+            } else {
+                log_host(
+                    LOG_WARN,
+                    &format!(
+                        "jxl_codec: oversized image {}x{} exceeds 2 GiB host buffer limit; downscaling to {}x{}",
+                        session.width, session.height, out_w, out_h
+                    ),
+                );
+                ScaledDecodeTarget {
+                    dec_w,
+                    dec_h,
+                    out_w,
+                    out_h,
+                    alpha: session.alpha,
+                    extra_channels: session.extra_channels,
+                }
+            }
         };
 
-        let mut runner = DecodeRunner::new(cancel);
-        if let Err(status) = decode_full_frame(
-            &mut session.decoder,
+        let buf = match decode_direct_or_downscaled(
+            session.decoder,
             &mut session.input,
-            &mut pixels,
-            FrameSpec {
-                width: session.width,
-                height: session.height,
-                extra_channels: session.extra_channels,
-            },
-            &mut runner,
+            target,
             cancel,
         ) {
-            return status;
-        }
-
-        let buf = match pixels.into_pixel_buffer(session.width, session.height) {
             Ok(b) => b,
             Err(status) => return status,
         };
@@ -2038,7 +2517,13 @@ fn try_decode_preview(
         };
     }
 
-    let same_aspect = target.pw <= target.max_w
+    let preview_fits_host = target
+        .pw
+        .checked_mul(target.ph)
+        .and_then(|n| n.checked_mul(4))
+        .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES);
+    let same_aspect = preview_fits_host
+        && target.pw <= target.max_w
         && target.ph <= target.max_h
         && (target.pw * target.dst_h).abs_diff(target.ph * target.dst_w)
             <= target.pw.max(target.ph);
@@ -2054,7 +2539,7 @@ fn try_decode_preview(
         .dst_w
         .checked_mul(target.dst_h)
         .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n <= MAX_OUTPUT_BYTES && n <= isize::MAX as usize)
+        .filter(|&n| n <= MAX_HOST_BUFFER_BYTES && n <= isize::MAX as usize)
     else {
         return Ok(None);
     };
@@ -2138,30 +2623,24 @@ unsafe extern "C" fn decode_static_raster_scaled(
         let max_w = max_width as usize;
         let max_h = max_height as usize;
         let (dst_w, dst_h) = fit_within_box(width, height, max_w, max_h);
+        let (dst_w, dst_h) = fit_within_host_budget(dst_w, dst_h);
 
-        // Unscaled fast path: source already fits inside max_width x max_height.
+        // Unscaled fast path: source already fits inside max_width x max_height
+        // and within the 2 GiB host buffer budget.
         if dst_w == width && dst_h == height {
-            let mut pixels = match allocate_checked_frame(width, height, input.compressed_margin())
-            {
-                Ok(b) => b,
-                Err(status) => return status,
-            };
-            let mut runner = DecodeRunner::new(cancel);
-            if let Err(status) = decode_full_frame(
-                &mut decoder,
+            let buf = match decode_direct_or_downscaled(
+                decoder,
                 &mut input,
-                &mut pixels,
-                FrameSpec {
-                    width,
-                    height,
+                ScaledDecodeTarget {
+                    dec_w: width,
+                    dec_h: height,
+                    out_w: width,
+                    out_h: height,
+                    alpha,
                     extra_channels,
                 },
-                &mut runner,
                 cancel,
             ) {
-                return status;
-            }
-            let buf = match pixels.into_pixel_buffer(width, height) {
                 Ok(b) => b,
                 Err(status) => return status,
             };
@@ -2218,64 +2697,21 @@ unsafe extern "C" fn decode_static_raster_scaled(
             }
         }
 
-        let thumb_bytes = match dst_w.checked_mul(dst_h).and_then(|n| n.checked_mul(4)) {
-            Some(n) if n <= MAX_OUTPUT_BYTES && n <= isize::MAX as usize => n,
-            _ => return DECODE_FAILED,
-        };
-        let mut full_pixels = match allocate_checked_frame(
-            width,
-            height,
-            thumb_bytes.saturating_add(input.compressed_margin()),
-        ) {
-            Ok(b) => b,
-            Err(status) => return status,
-        };
-        let Some(mut thumb_pixels) = AlignedBuffer::alloc_zeroed(thumb_bytes) else {
-            log_host(
-                LOG_ERROR,
-                &format!("jxl_codec: thumbnail buffer allocation failed ({dst_w}x{dst_h})"),
-            );
-            return OUT_OF_MEMORY;
-        };
-
-        let mut runner = DecodeRunner::new(cancel);
-        // Decode to frame completion before downscaling; `flush_pixels() == Ok(true)`
-        // only indicates partial dirty-region updates rather than whole-frame coverage.
-        if let Err(status) = decode_full_frame(
-            &mut decoder,
+        let shift = choose_downsample_shift(width, height, dst_w, dst_h);
+        let (dec_w, dec_h) = apply_native_downsample(&mut decoder, width, height, shift);
+        let buf = match decode_direct_or_downscaled(
+            decoder,
             &mut input,
-            &mut full_pixels,
-            FrameSpec {
-                width,
-                height,
+            ScaledDecodeTarget {
+                dec_w,
+                dec_h,
+                out_w: dst_w,
+                out_h: dst_h,
+                alpha,
                 extra_channels,
             },
-            &mut runner,
             cancel,
         ) {
-            return status;
-        }
-
-        if let Err(status) = downscale_bgra8(
-            ImagePlane {
-                data: full_pixels.as_slice(),
-                width,
-                height,
-            },
-            ImagePlaneMut {
-                data: thumb_pixels.as_mut_slice(),
-                width: dst_w,
-                height: dst_h,
-            },
-            alpha,
-            &mut runner,
-            cancel,
-        ) {
-            return status;
-        }
-        drop(full_pixels);
-
-        let buf = match thumb_pixels.into_pixel_buffer(dst_w, dst_h) {
             Ok(b) => b,
             Err(status) => return status,
         };
@@ -2375,10 +2811,13 @@ fn boundary(f: impl FnOnce() -> IGStatus) -> IGStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jxl::api::{JxlAnimation, JxlBitDepth, JxlExtraChannel, Orientation, ToneMapping};
+    use jxl::api::{
+        JxlAnimation, JxlBitDepth, JxlExtraChannel, Orientation, RenderingIntent, ToneMapping,
+    };
     use std::sync::atomic::AtomicI32;
 
     static HOST_CORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static GLOBAL_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct HostCoreGuard<'a> {
         _lock: std::sync::MutexGuard<'a, ()>,
@@ -2802,6 +3241,9 @@ mod tests {
 
     #[test]
     fn decode_runner_parallel_serial_cancel_error_and_panic() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Serial and parallel execution each visit every task index exactly once.
         for max_threads in [Some(1), Some(4)] {
             let counts: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
@@ -2884,6 +3326,9 @@ mod tests {
 
     #[test]
     fn host_log_callback_and_shutdown_cleanup() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static TEST_LOGS: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
         unsafe extern "C" fn capture_log(level: i32, msg: IGStringRef) {
             if !msg.data.is_null() && msg.length > 0 {
@@ -2926,7 +3371,12 @@ mod tests {
             let mut icc = state.icc.lock().unwrap();
             assert!(icc.retain_with_key(&[1, 2, 3, 4]).is_some());
         }
+        let mut warmup_runner = DecodeRunner::new(std::ptr::null_mut());
+        warmup_runner
+            .run_ordered(32, Some(4), &|_| Ok(()))
+            .expect("warmup runner succeeds");
         unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
         assert!(state.decoders.lock().unwrap().is_empty());
         {
             let icc = state.icc.lock().unwrap();
@@ -2938,6 +3388,468 @@ mod tests {
         let dec = PooledDecoder::checkout();
         drop(dec);
         assert_eq!(state.decoders.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn srgb_encoding_detection_skips_only_standard_srgb() {
+        assert!(is_standard_srgb_encoding(
+            &JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::SRGB,
+                rendering_intent: RenderingIntent::Relative,
+            }
+        ));
+        assert!(is_standard_srgb_encoding(
+            &JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::SRGB,
+                rendering_intent: RenderingIntent::Perceptual,
+            }
+        ));
+        assert!(is_standard_srgb_encoding(
+            &JxlColorEncoding::GrayscaleColorSpace {
+                white_point: JxlWhitePoint::D65,
+                transfer_function: JxlTransferFunction::SRGB,
+                rendering_intent: RenderingIntent::Relative,
+            }
+        ));
+
+        let non_srgb = [
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::P3,
+                transfer_function: JxlTransferFunction::SRGB,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::BT2100,
+                transfer_function: JxlTransferFunction::PQ,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::BT2100,
+                transfer_function: JxlTransferFunction::HLG,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::Linear,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::BT709,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::D65,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::Gamma(2.2),
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::RgbColorSpace {
+                white_point: JxlWhitePoint::DCI,
+                primaries: JxlPrimaries::SRGB,
+                transfer_function: JxlTransferFunction::SRGB,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::GrayscaleColorSpace {
+                white_point: JxlWhitePoint::D65,
+                transfer_function: JxlTransferFunction::Linear,
+                rendering_intent: RenderingIntent::Relative,
+            },
+            JxlColorEncoding::XYB {
+                rendering_intent: RenderingIntent::Perceptual,
+            },
+        ];
+        for enc in &non_srgb {
+            assert!(!is_standard_srgb_encoding(enc), "unexpected skip for {enc}");
+        }
+    }
+
+    #[test]
+    fn host_budget_and_downsample_shift_helpers() {
+        assert_eq!(fit_within_host_budget(16_000, 9_000), (16_000, 9_000));
+        assert_eq!(fit_within_host_budget(25_920, 14_580), (25_920, 14_580));
+
+        let (fw, fh) = fit_within_host_budget(32_000, 18_000);
+        assert!(fw < 32_000 && fh < 18_000);
+        assert!(fw * fh * 4 <= MAX_HOST_BUFFER_BYTES);
+        let aspect = (fw as f64) / (fh as f64);
+        assert!((aspect - (16.0 / 9.0)).abs() < 0.01);
+
+        let (sq_w, sq_h) = fit_within_host_budget(32_000, 32_000);
+        assert_eq!(sq_w, sq_h);
+        assert!(sq_w * sq_h * 4 <= MAX_HOST_BUFFER_BYTES);
+
+        // Extreme aspect ratios fit in O(1) without single-pixel decrement stalls.
+        for (w, h) in [
+            (1, 1_024_000_000),
+            (1_024_000_000, 1),
+            (MAX_HOST_PIXELS + 1, 1),
+            (2, 1_000_000_000),
+        ] {
+            let (ew, eh) = fit_within_host_budget(w, h);
+            assert!(ew >= 1 && eh >= 1 && ew <= w && eh <= h);
+            assert!(
+                ew.checked_mul(eh)
+                    .and_then(|n| n.checked_mul(4))
+                    .is_some_and(|b| b <= MAX_HOST_BUFFER_BYTES),
+                "extreme aspect {w}x{h} -> {ew}x{eh} exceeded budget"
+            );
+        }
+
+        assert_eq!(choose_downsample_shift(16_000, 9_000, 140, 79), 3);
+        assert_eq!(choose_downsample_shift(1_000, 1_000, 300, 300), 1);
+        assert_eq!(choose_downsample_shift(1_000, 1_000, 600, 600), 0);
+        assert_eq!(choose_downsample_shift(1_000, 1_000, 250, 250), 2);
+
+        assert_eq!(choose_host_budget_shift(32_000, 18_000), 1);
+        assert_eq!(choose_host_budget_shift(32_000, 32_000), 1);
+
+        // Pure layout validation tests MAX_HOST_BUFFER_BYTES independently of backing allocation.
+        assert!(validate_pixel_buffer_layout(MAX_HOST_BUFFER_BYTES, MAX_HOST_PIXELS, 1).is_ok());
+        assert_eq!(
+            validate_pixel_buffer_layout(usize::MAX, MAX_HOST_PIXELS + 1, 1),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(
+            validate_pixel_buffer_layout(usize::MAX, 32_000, 18_000),
+            Err(DECODE_FAILED)
+        );
+        assert_eq!(validate_pixel_buffer_layout(16, 4, 2), Err(DECODE_FAILED));
+    }
+
+    fn reference_downscale_bgra8(
+        src: &[u8],
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        has_alpha: bool,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; dst_w * dst_h * 4];
+        for dy in 0..dst_h {
+            let y0 = ((dy as u128 * src_h as u128) / dst_h as u128) as usize;
+            let y1 = ((((dy + 1) as u128 * src_h as u128) / dst_h as u128) as usize)
+                .max(y0 + 1)
+                .min(src_h);
+            for dx in 0..dst_w {
+                let x0 = ((dx as u128 * src_w as u128) / dst_w as u128) as usize;
+                let x1 = ((((dx + 1) as u128 * src_w as u128) / dst_w as u128) as usize)
+                    .max(x0 + 1)
+                    .min(src_w);
+                let count = ((x1 - x0) as u64) * ((y1 - y0) as u64);
+                let dst_off = (dy * dst_w + dx) * 4;
+                if !has_alpha {
+                    let (mut sb, mut sg, mut sr) = (0u64, 0u64, 0u64);
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            let off = (sy * src_w + sx) * 4;
+                            sb += src[off] as u64;
+                            sg += src[off + 1] as u64;
+                            sr += src[off + 2] as u64;
+                        }
+                    }
+                    let half = count / 2;
+                    out[dst_off] = ((sb + half) / count) as u8;
+                    out[dst_off + 1] = ((sg + half) / count) as u8;
+                    out[dst_off + 2] = ((sr + half) / count) as u8;
+                    out[dst_off + 3] = 255;
+                } else {
+                    let (mut sba, mut sga, mut sra, mut sa) = (0u64, 0u64, 0u64, 0u64);
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            let off = (sy * src_w + sx) * 4;
+                            let a = src[off + 3] as u64;
+                            sba += (src[off] as u64) * a;
+                            sga += (src[off + 1] as u64) * a;
+                            sra += (src[off + 2] as u64) * a;
+                            sa += a;
+                        }
+                    }
+                    let out_a = ((sa + count / 2) / count) as u8;
+                    if sa > 0 {
+                        let half_a = sa / 2;
+                        out[dst_off] = ((sba + half_a) / sa).min(255) as u8;
+                        out[dst_off + 1] = ((sga + half_a) / sa).min(255) as u8;
+                        out[dst_off + 2] = ((sra + half_a) / sa).min(255) as u8;
+                    }
+                    out[dst_off + 3] = out_a;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn downscale_bgra8_row_major_matches_reference_across_odd_and_tiled_sizes() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut runner = DecodeRunner::new(std::ptr::null_mut());
+        for (src_w, src_h, dst_w, dst_h) in [(17, 13, 5, 7), (600, 19, 300, 5), (800, 128, 300, 16)]
+        {
+            let mut src = vec![0u8; src_w * src_h * 4];
+            for y in 0..src_h {
+                for x in 0..src_w {
+                    let off = (y * src_w + x) * 4;
+                    src[off] = (x * 37 + y * 53) as u8;
+                    src[off + 1] = (x * 19 + y * 71 + 11) as u8;
+                    src[off + 2] = (x * 43 + y * 29 + 7) as u8;
+                    src[off + 3] = match (x + y) % 4 {
+                        0 => 0,
+                        1 => 17,
+                        2 => 128,
+                        _ => 255,
+                    };
+                }
+            }
+            for has_alpha in [false, true] {
+                let mut dst = vec![0u8; dst_w * dst_h * 4];
+                downscale_bgra8(
+                    ImagePlane {
+                        data: &src,
+                        width: src_w,
+                        height: src_h,
+                    },
+                    ImagePlaneMut {
+                        data: &mut dst,
+                        width: dst_w,
+                        height: dst_h,
+                    },
+                    has_alpha,
+                    &mut runner,
+                    std::ptr::null_mut(),
+                )
+                .expect("row-major downscale succeeds");
+                let expected =
+                    reference_downscale_bgra8(&src, src_w, src_h, dst_w, dst_h, has_alpha);
+                assert_eq!(
+                    dst, expected,
+                    "mismatch for {src_w}x{src_h} -> {dst_w}x{dst_h} (has_alpha={has_alpha})"
+                );
+            }
+        }
+
+        // Mid-band cancellation inside `for sy in y0..y1` on tall dst_h=1 band.
+        static POLL_COUNT: AtomicI32 = AtomicI32::new(0);
+        unsafe extern "C" fn poll_cancel_after_two(tok: *mut c_void) -> i32 {
+            let calls = unsafe { &*(tok as *const AtomicI32) }.fetch_add(1, Ordering::AcqRel) + 1;
+            i32::from(calls >= 3)
+        }
+        POLL_COUNT.store(0, Ordering::Release);
+        let mut core = IGHostCoreApi {
+            log: None,
+            alloc: None,
+            free: None,
+            is_cancellation_requested: Some(poll_cancel_after_two),
+            get_config_directory: None,
+        };
+        let _guard = HostCoreGuard::install(&mut core);
+        let token = (&POLL_COUNT as *const AtomicI32) as *mut c_void;
+        let mut cancel_runner = DecodeRunner::new(token);
+        let src = vec![0x77u8; 64 * 256 * 4];
+        let mut dst = vec![0u8; 16 * 4];
+        let status = downscale_bgra8(
+            ImagePlane {
+                data: &src,
+                width: 64,
+                height: 256,
+            },
+            ImagePlaneMut {
+                data: &mut dst,
+                width: 16,
+                height: 1,
+            },
+            false,
+            &mut cancel_runner,
+            token,
+        );
+        assert_eq!(status, Err(CANCELED));
+
+        // Wide single-row mid-span cancellation (y1 - y0 == 1 < 64) polls by pixel budget.
+        POLL_COUNT.store(0, Ordering::Release);
+        let wide_src = vec![0x55u8; (DOWNSCALE_CANCEL_POLL_PIXELS * 2) * 4];
+        let mut wide_dst = [0u8; 4];
+        let mut wide_runner = DecodeRunner::new(token);
+        let wide_status = downscale_bgra8(
+            ImagePlane {
+                data: &wide_src,
+                width: DOWNSCALE_CANCEL_POLL_PIXELS * 2,
+                height: 1,
+            },
+            ImagePlaneMut {
+                data: &mut wide_dst,
+                width: 1,
+                height: 1,
+            },
+            false,
+            &mut wide_runner,
+            token,
+        );
+        assert_eq!(wide_status, Err(CANCELED));
+
+        // Post-loop cancellation check catches cancellation arriving right at task completion.
+        POLL_COUNT.store(0, Ordering::Release);
+        let tiny_src = vec![0x33u8; 4 * 4 * 4];
+        let mut tiny_dst = vec![0u8; 2 * 2 * 4];
+        let mut post_runner = DecodeRunner::new(token);
+        let post_status = downscale_bgra8(
+            ImagePlane {
+                data: &tiny_src,
+                width: 4,
+                height: 4,
+            },
+            ImagePlaneMut {
+                data: &mut tiny_dst,
+                width: 2,
+                height: 2,
+            },
+            false,
+            &mut post_runner,
+            token,
+        );
+        assert_eq!(post_status, Err(CANCELED));
+    }
+
+    #[test]
+    fn global_worker_pool_concurrent_jobs_isolation_and_shutdown_reuse() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+
+        thread::scope(|s| {
+            let mut handles = Vec::new();
+            for job_id in 0..4usize {
+                handles.push(s.spawn(move || {
+                    let counts: Vec<AtomicUsize> = (0..128).map(|_| AtomicUsize::new(0)).collect();
+                    let mut runner = DecodeRunner::new(std::ptr::null_mut());
+                    runner.max_threads = 8;
+                    let res = runner.run_ordered(128, Some(8), &|i| {
+                        counts[i].fetch_add(1, Ordering::SeqCst);
+                        if job_id == 3 && i == 17 {
+                            return Err(JxlError::InvalidSignature);
+                        }
+                        if i % 16 == 0 {
+                            thread::yield_now();
+                        }
+                        Ok(())
+                    });
+                    (job_id, res, counts)
+                }));
+            }
+            for h in handles {
+                let (job_id, res, counts) = h.join().expect("concurrent job thread panicked");
+                if job_id == 3 {
+                    assert!(matches!(res, Err(JxlError::InvalidSignature)));
+                } else {
+                    assert!(res.is_ok(), "job {job_id} failed unexpectedly: {res:?}");
+                    assert!(counts.iter().all(|c| c.load(Ordering::SeqCst) == 1));
+                }
+            }
+        });
+
+        let expected_cap = default_threads().saturating_sub(1);
+        if expected_cap > 0 {
+            let guard = GLOBAL_POOL.lock().unwrap();
+            let handle = guard.handle.as_ref().expect("global pool created");
+            assert!(handle.workers.len() <= expected_cap);
+        }
+
+        unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+
+        let post_counts: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+        let mut post_runner = DecodeRunner::new(std::ptr::null_mut());
+        post_runner.max_threads = 4;
+        post_runner
+            .run_ordered(64, Some(4), &|i| {
+                post_counts[i].fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("pool lazily recreates after shutdown");
+        assert!(post_counts.iter().all(|c| c.load(Ordering::SeqCst) == 1));
+        unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+    }
+
+    #[test]
+    fn global_worker_pool_blocks_acquisition_and_serializes_shutdown_while_draining() {
+        let _pool_guard = GLOBAL_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if default_threads() <= 1 {
+            return;
+        }
+        unsafe { shutdown() };
+        assert!(GLOBAL_POOL.lock().unwrap().handle.is_none());
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate_job = Arc::clone(&gate);
+        let entered_job = Arc::clone(&entered);
+
+        let job_thread = thread::spawn(move || {
+            let mut runner = DecodeRunner::new(std::ptr::null_mut());
+            runner.max_threads = 2;
+            runner
+                .run_ordered(2, Some(2), &|_| {
+                    entered_job.fetch_add(1, Ordering::SeqCst);
+                    let mut released = gate_job.0.lock().unwrap();
+                    while !*released {
+                        released = gate_job.1.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .expect("in-flight job finishes cleanly");
+        });
+
+        while entered.load(Ordering::SeqCst) < 2 {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let shutdown_t1 = thread::spawn(shutdown_global_pool);
+        while !GLOBAL_POOL.lock().unwrap().shutting_down {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // Acquisition while draining must refuse creating a replacement pool.
+        assert!(acquire_global_pool(4).is_none());
+
+        // A concurrent shutdown must wait until the first drain completes.
+        let t2_done = Arc::new(AtomicBool::new(false));
+        let t2_done_clone = Arc::clone(&t2_done);
+        let shutdown_t2 = thread::spawn(move || {
+            shutdown_global_pool();
+            t2_done_clone.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(15));
+        assert!(!t2_done.load(Ordering::Acquire));
+
+        {
+            let mut released = gate.0.lock().unwrap();
+            *released = true;
+            gate.1.notify_all();
+        }
+        job_thread.join().expect("job thread joined");
+        shutdown_t1.join().expect("first shutdown joined");
+        shutdown_t2.join().expect("second shutdown joined");
+
+        assert!(t2_done.load(Ordering::Acquire));
+        {
+            let lifecycle = GLOBAL_POOL.lock().unwrap();
+            assert!(lifecycle.handle.is_none());
+            assert!(!lifecycle.shutting_down);
+        }
     }
 
     #[test]
