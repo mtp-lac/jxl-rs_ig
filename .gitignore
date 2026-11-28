@@ -4,6 +4,9 @@
 
 # Local scratch / dev tooling
 /probe/
+/AGENTS.md
+/docs/agents/
+__pycache__/
 REPORT-*.md
 CHANGELOG.md
 
