@@ -74,20 +74,37 @@ The build produces a shared library:
 - Linux: `target/release/libjxl_codec.so`
 - macOS: `target/release/libjxl_codec.dylib`
 
-Release archives also ship platform manifests (`igplugin.json` for Windows,
-`igplugin.linux.json` for Linux, and `igplugin.macos.json` for macOS) alongside
-`LICENSE` and `THIRD_PARTY_NOTICES.txt`.
+GitHub Releases ship ready-to-install `.igplugin.zip` packages
+(`jxl-codec_win-x64.igplugin.zip`, `jxl-codec_linux-x64.igplugin.zip`, and
+`jxl-codec_osx-arm64.igplugin.zip`), each containing `Plugin_JxlCodec/` with
+`igplugin.json`, the platform binary, `LICENSE`, and `THIRD_PARTY_NOTICES.txt`,
+alongside the raw binaries and platform manifests.
+
+To build a `.igplugin.zip` package locally:
+
+```bash
+python scripts/package-plugin.py --platform win-x64 --binary target/release/jxl_codec.dll
+```
 
 ## Installation
+
+### Recommended: Install `.igplugin.zip` in ImageGlass
+
+1. Download the `.igplugin.zip` file for your platform from [Releases](../../releases)
+2. Open ImageGlass and go to **Settings > Plugins**
+3. Click **Add** and select the downloaded `.igplugin.zip` file
+4. Click the newly added plugin and choose **Trust and enable**
+
+### Manual installation
 
 1. Copy the shared library for your platform:
    - **Windows**: `JxlCodec.dll` (rename `jxl_codec.dll` if built locally)
    - **Linux**: `libjxl_codec.so`
    - **macOS**: `libjxl_codec.dylib`
 2. Create a plugin folder in ImageGlass's config directory:
-   - **Windows**: `%LocalAppData%\ImageGlass\_plugins\JxlCodec\`
-   - **Linux**: `~/.local/share/ImageGlass/_plugins/JxlCodec/`
-   - **macOS**: `/Users/<username>/Library/Application Support/ImageGlass/_plugins/JxlCodec/`
+   - **Windows**: `%LocalAppData%\ImageGlass\_plugins\Plugin_JxlCodec\`
+   - **Linux**: `~/.local/share/ImageGlass/_plugins/Plugin_JxlCodec/`
+   - **macOS**: `/Users/<username>/Library/Application Support/ImageGlass/_plugins/Plugin_JxlCodec/`
 3. Copy the library and the matching manifest (renamed to `igplugin.json` in the
    plugin folder — `igplugin.linux.json` on Linux, `igplugin.macos.json` on macOS)
    into this folder

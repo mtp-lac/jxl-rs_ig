@@ -157,6 +157,10 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Package .igplugin.zip archives
+        shell: bash
+        run: python3 scripts/package-plugin.py --artifacts-dir artifacts --out-dir dist
+
       - name: Create / update nightly pre-release
         uses: softprops/action-gh-release@v2
         with:
@@ -167,6 +171,7 @@ jobs:
             Pre-release — not intended for production use.
           prerelease: true
           files: |
+            dist/*.igplugin.zip
             artifacts/*
             igplugin.json
             igplugin.linux.json

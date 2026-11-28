@@ -103,10 +103,15 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Package .igplugin.zip archives
+        shell: bash
+        run: python3 scripts/package-plugin.py --artifacts-dir artifacts --out-dir dist
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/*.igplugin.zip
             artifacts/*
             igplugin.json
             igplugin.linux.json
