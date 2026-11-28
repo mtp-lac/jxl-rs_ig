@@ -89,14 +89,6 @@ jobs:
             exit 1
           fi
 
-      - name: Generate platform manifests
-        shell: bash
-        run: |
-          jq '.executable = "libjxl_codec.so"' igplugin.json > igplugin.linux.json
-          jq '.executable = "libjxl_codec.dylib"' igplugin.json > igplugin.macos.json
-          jq -e '.executable == "libjxl_codec.so"' igplugin.linux.json >/dev/null
-          jq -e '.executable == "libjxl_codec.dylib"' igplugin.macos.json >/dev/null
-
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -112,10 +104,4 @@ jobs:
         with:
           files: |
             dist/*.igplugin.zip
-            artifacts/*
-            igplugin.json
-            igplugin.linux.json
-            igplugin.macos.json
-            LICENSE
-            THIRD_PARTY_NOTICES.txt
           generate_release_notes: true
