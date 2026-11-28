@@ -459,7 +459,7 @@ fn main() {
     unsafe { free_fn(&mut scaled_buf) };
     assert_zero_pixel_buffer(&scaled_buf);
 
-    // Real downscaling fixture: 256x256 alternating black/white columns -> uniform [128,128,128,255]
+    // Real downscaling fixture: 256x256 alternating black/white columns -> midpoint 127.5 (127..=128 after rounding/dithering, alpha 255)
     let stripes_path = std::env::temp_dir().join(format!("jxl_codec_stripes_test_{pid}.jxl"));
     std::fs::write(&stripes_path, STRIPES_256X256_JXL).expect("write stripes test file");
     let wide_stripes = to_wide(stripes_path.to_str().unwrap());
@@ -521,7 +521,10 @@ fn main() {
         let bytes = (down_buf.height * down_buf.stride) as usize;
         let down_slice = unsafe { std::slice::from_raw_parts(down_buf.data, bytes) };
         for px in down_slice.as_chunks::<4>().0 {
-            assert_eq!(px, &[128, 128, 128, 255], "expected box-averaged pixel");
+            assert!(
+                px[..3].iter().all(|&c| (127..=128).contains(&c)) && px[3] == 255,
+                "expected box-averaged pixel near 127.5 with opaque alpha, got {px:?}"
+            );
         }
         unsafe { free_fn(&mut down_buf) };
     }
